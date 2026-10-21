@@ -426,3 +426,14 @@ def test_openai_tts_synthesize():
 
     assert result.audio == b"fake-openai-audio"
     assert result.voice_id == "nova"
+
+
+def test_kokoro_ptbr_accent_rewrites_espeak_phonemes():
+    """pt-br: coda/final r become "h", no epenthetic vowel, closed final a, lh as ʎ."""
+    from openjarvis.speech.kokoro_tts import ptbr_accent
+
+    assert ptbr_accent("pˈɔɾətæ") == "pˈɔhtɐ"  # porta
+    assert ptbr_accent("tˈaɾəʤy") == "tˈahʤy"  # tarde
+    assert ptbr_accent("trˌabaljˈar.") == "trˌabaʎˈah."  # trabalhar
+    assert ptbr_accent("xˈatʊ kˈaxʊ") == "xˈatʊ kˈaxʊ"  # rato, carro: already Brazilian
+    assert ptbr_accent("kriˈaɾ ˈoʒy") == "kriˈaɾ ˈoʒy"  # linking tap before a vowel stays

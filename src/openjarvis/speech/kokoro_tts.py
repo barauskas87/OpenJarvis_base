@@ -14,6 +14,8 @@ female (prefix ``z`` → ``lang_code="z"``).
 from __future__ import annotations
 
 import io
+import os
+import re
 import threading
 from collections import OrderedDict
 from typing import Any, Dict, List
@@ -35,6 +37,27 @@ _VOICE_PREFIX_TO_LANG: Dict[str, str] = {
     "h": "h",  # Hindi
     "e": "e",  # Spanish
 }
+
+# Brazilian accent for lang_code "p". espeak-ng "pt-br" gets the palatal t/d
+# and the initial r (x) right, but (1) inserts a vowel after a coda r
+# (porta -> "pˈɔɾətæ", heard as "pó-rë-ta"), (2) trills the word-final r
+# (trabalhar -> "...ˈar", heard as European Portuguese / Spanish) and (3) uses
+# an open final a (æ) and "lj" for lh. The fix rewrites the phonemes before the
+# model: coda and final r -> "h" (Rio / São Paulo), æ -> ɐ, lj -> ʎ.
+# OPENJARVIS_KOKORO_PTBR_ACCENT=0 turns it off.
+_PTBR_CONSONANTS = "bcdfgjklmnpqstvwxzʃʒʧʤɡŋɲʎ"
+
+
+def ptbr_accent(phonemes: str) -> str:
+    """Rewrite espeak-ng pt-br phonemes toward a Brazilian (Rio / SP) accent."""
+    phonemes = re.sub(rf"ɾə(?=ˈ?ˌ?[{_PTBR_CONSONANTS}])", "h", phonemes)
+    phonemes = re.sub(r"r(?=[\s.,!?;:…]|$)", "h", phonemes)
+    return phonemes.replace("æ", "ɐ").replace("lj", "ʎ")
+
+
+def _ptbr_accent_enabled() -> bool:
+    return os.environ.get("OPENJARVIS_KOKORO_PTBR_ACCENT", "1") != "0"
+
 
 _DEFAULT_LANG_CODE = "a"
 _DEFAULT_VOICE_ID = "af_heart"
@@ -116,6 +139,14 @@ class KokoroTTSBackend(TTSBackend):
                     f"Try: {hint}. Original error: {exc}"
                 ) from exc
 
+            if lang_code == "p" and _ptbr_accent_enabled():
+                g2p = pipeline.g2p
+
+                def g2p_ptbr(text: str, _g2p: Any = g2p) -> Any:
+                    phonemes, *rest = _g2p(text)
+                    return (ptbr_accent(phonemes), *rest)
+
+                pipeline.g2p = g2p_ptbr
             self._pipelines[lang_code] = pipeline
             if len(self._pipelines) > self._max_cached_pipelines:
                 _, evicted = self._pipelines.popitem(last=False)
