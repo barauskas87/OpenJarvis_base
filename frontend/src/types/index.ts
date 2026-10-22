@@ -189,6 +189,7 @@ export interface ServerInfo {
   model: string;
   agent: string | null;
   engine: string;
+  local_engine?: string;
 }
 
 // --- Log Types ---

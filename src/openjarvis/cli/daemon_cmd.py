@@ -468,7 +468,7 @@ def start(
         raise click.ClickException(str(registration_error)) from registration_error
 
     console.print(
-        f"[green]OpenJarvis server starting[/green] (launch PID {proc.pid})\n"
+        f"[green]Tradelit server starting[/green] (launch PID {proc.pid})\n"
         f"  Requested URL: {_server_url(bind_host, bind_port)}\n"
         f"  Log: {_LOG_FILE}"
     )

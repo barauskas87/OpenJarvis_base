@@ -1607,6 +1607,58 @@ class TestModelsEndpoint:
         assert "Hello" in resp.text
         assert '"engine": "litellm"' in resp.text
 
+    def _lmstudio_app(self, model):
+        from openjarvis.engine.multi import MultiEngine
+
+        local = _make_engine(models=[model])
+        local.engine_id = "lmstudio"
+        cloud = _make_engine(models=["gpt-4o"])
+        engine = MultiEngine([("lmstudio", local), ("cloud", cloud)])
+        return create_app(engine, model, engine_name="multi", config=_test_config())
+
+    def test_local_vendor_qualified_model_is_listed(self):
+        """LM Studio IDs like ``openai/gpt-oss-20b`` are local, not OpenRouter."""
+        model = "openai/gpt-oss-20b"
+        client = TestClient(self._lmstudio_app(model))
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [item["id"] for item in resp.json()["data"]] == [model]
+
+    def test_single_local_engine_vendor_qualified_model_is_listed(self):
+        model = "openai/gpt-oss-20b"
+        engine = _make_engine(models=[model])
+        engine.engine_id = "lmstudio"
+        app = create_app(engine, model, engine_name="lmstudio", config=_test_config())
+        resp = TestClient(app).get("/v1/models")
+
+        assert [item["id"] for item in resp.json()["data"]] == [model]
+
+    def test_local_vendor_qualified_model_does_not_use_cloud(self):
+        model = "openai/gpt-oss-20b"
+        app = self._lmstudio_app(model)
+
+        async def direct_cloud_tokens():
+            yield "wrong backend"
+
+        with patch(
+            "openjarvis.server.cloud_router.stream_cloud",
+            return_value=direct_cloud_tokens(),
+        ) as stream_cloud:
+            client = TestClient(app)
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        stream_cloud.assert_not_called()
+        assert "wrong backend" not in resp.text
+
 
 # ---------------------------------------------------------------------------
 # Health endpoint tests

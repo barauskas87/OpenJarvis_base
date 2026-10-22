@@ -24,6 +24,7 @@ import {
   fetchSpeechHealth,
   fetchTtsHealth,
   getMemoryStats,
+  fetchModels,
   getInferenceSource,
   setInferenceSource,
   getCloudKeyStatus,
@@ -39,22 +40,39 @@ import { isAutoUpdateDisabled, setAutoUpdateDisabled } from '../components/Deskt
 
 const CLOUD_KEY_STATUS_CHANGED = 'openjarvis-cloud-key-status-changed';
 
-function OllamaModelList() {
-  const [models, setModels] = useState<Array<{ name: string; size: number }>>([]);
+const LOCAL_ENGINE_LABELS: Record<string, string> = {
+  ollama: 'Ollama',
+  lmstudio: 'LM Studio',
+  llamacpp: 'llama.cpp',
+  mlx: 'MLX',
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  exo: 'Exo',
+  nexa: 'Nexa',
+};
+
+function localEngineLabel(engine?: string): string {
+  if (!engine || engine === 'multi') return 'Ollama';
+  return LOCAL_ENGINE_LABELS[engine] ?? engine;
+}
+
+function LocalModelList() {
+  const [models, setModels] = useState<string[]>([]);
   useEffect(() => {
-    fetch('http://localhost:11434/api/tags')
-      .then(r => r.json())
-      .then(data => setModels((data.models || []).map((m: any) => ({ name: m.name, size: m.size }))))
+    // Ask the OpenJarvis server rather than a specific engine's port so the
+    // list reflects whichever local engine is configured (Ollama, LM Studio, ...).
+    fetchModels()
+      .then(data => setModels(data.map(m => m.id)))
       .catch(() => setModels([]));
   }, []);
   if (models.length === 0) return <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>No models loaded</span>;
   return (
     <div className="flex flex-wrap gap-1">
-      {models.map(m => (
-        <span key={m.name} className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px]"
+      {models.map(name => (
+        <span key={name} className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px]"
           style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text)' }}>
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--color-success)', display: 'inline-block' }} />
-          {m.name} ({(m.size / 1e9).toFixed(1)} GB)
+          {name}
         </span>
       ))}
     </div>
@@ -478,7 +496,7 @@ export function SettingsPage() {
         <div className="flex flex-col gap-4">
           {/* Appearance */}
           <Section title="Appearance">
-            <SettingRow label="Theme" description="Choose how OpenJarvis looks">
+            <SettingRow label="Theme" description="Choose how Tradelit looks">
               <div className="flex gap-1 p-0.5 rounded-lg" style={{ background: 'var(--color-bg-secondary)' }}>
                 {themeOptions.map((opt) => {
                   const isActive = settings.theme === opt.value;
@@ -616,11 +634,15 @@ export function SettingsPage() {
 
           {/* Models */}
           <Section title="Models">
-            <SettingRow label="Local models (Ollama)" description="Models available for local inference">
-              <OllamaModelList />
+            <SettingRow label={`Local models (${localEngineLabel(serverInfo?.local_engine)})`} description="Models available for local inference">
+              <LocalModelList />
             </SettingRow>
             <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
-              Run <code className="px-1 py-0.5 rounded text-[11px]" style={{ background: 'var(--color-bg-tertiary)' }}>ollama pull &lt;model-name&gt;</code> in your terminal to add more models
+              {localEngineLabel(serverInfo?.local_engine) === 'Ollama' ? (
+                <>Run <code className="px-1 py-0.5 rounded text-[11px]" style={{ background: 'var(--color-bg-tertiary)' }}>ollama pull &lt;model-name&gt;</code> in your terminal to add more models</>
+              ) : (
+                <>Download and load models in {localEngineLabel(serverInfo?.local_engine)} to add more models</>
+              )}
             </div>
             <SettingRow label="Cloud providers" description="Green dot means API key is configured">
               <div className="flex flex-wrap gap-3">
@@ -956,7 +978,7 @@ export function SettingsPage() {
           <Section title="About">
             <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
               <p className="mb-2">
-                <span className="font-semibold" style={{ color: 'var(--color-text)' }}>OpenJarvis</span> — Programming abstractions for on-device AI.
+                <span className="font-semibold" style={{ color: 'var(--color-text)' }}>Tradelit</span> — built on OpenJarvis, programming abstractions for on-device AI.
               </p>
               <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                 Part of Intelligence Per Watt, a research initiative at Stanford SAIL.

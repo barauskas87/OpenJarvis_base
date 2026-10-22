@@ -449,11 +449,44 @@ def _engine_key_for_model(engine: Any, model: str) -> str | None:
     return None
 
 
+def _local_engine_owns_model(engine: Any, model: str) -> bool:
+    """Whether a non-cloud engine advertises *model*.
+
+    Local servers such as LM Studio publish vendor-qualified IDs like
+    ``openai/gpt-oss-20b`` that look like OpenRouter IDs to
+    :func:`is_cloud_model`; the engine that actually lists the model wins.
+    """
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    current = engine
+    while isinstance(current, (InstrumentedEngine, GuardrailsEngine)):
+        current = (
+            current._inner
+            if isinstance(current, InstrumentedEngine)
+            else current._engine
+        )
+    if isinstance(current, MultiEngine):
+        key = current.engine_key_for(model)
+        return key is not None and key != "cloud"
+    if getattr(current, "engine_id", None) in (None, "cloud", "litellm"):
+        return False
+    try:
+        return model in current.list_models()
+    except Exception:
+        return False
+
+
 def _uses_direct_cloud_router(engine: Any, model: str) -> bool:
     """Whether *model* should bypass the configured engine for direct cloud."""
     from openjarvis.server.cloud_router import is_cloud_model
 
-    return is_cloud_model(model) and _engine_key_for_model(engine, model) != "litellm"
+    return (
+        is_cloud_model(model)
+        and _engine_key_for_model(engine, model) != "litellm"
+        and not _local_engine_owns_model(engine, model)
+    )
 
 
 def _handle_direct(
@@ -1122,7 +1155,9 @@ async def list_models(request: Request) -> ModelListResponse:
     model_ids = [
         m
         for m in all_ids
-        if not is_cloud_model(m) or _engine_key_for_model(engine, m) == "litellm"
+        if not is_cloud_model(m)
+        or _engine_key_for_model(engine, m) == "litellm"
+        or _local_engine_owns_model(engine, m)
     ]
     if not model_ids:
         model_ids = await list_local_models()
@@ -1378,10 +1413,16 @@ async def server_info(request: Request):
     # Fall back to configured agent name if agent didn't instantiate
     if agent_id is None:
         agent_id = getattr(request.app.state, "agent_name", None)
+    engine_name = getattr(request.app.state, "engine_name", "")
+    # "engine" may be "multi"; "local_engine" names the configured backend
+    # (ollama, lmstudio, ...) so the UI can label local models correctly.
+    config = getattr(request.app.state, "config", None)
+    local_engine = getattr(getattr(config, "engine", None), "default", None)
     return {
         "model": getattr(request.app.state, "model", ""),
         "agent": agent_id,
-        "engine": getattr(request.app.state, "engine_name", ""),
+        "engine": engine_name,
+        "local_engine": local_engine or engine_name,
     }
 
 

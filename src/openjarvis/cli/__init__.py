@@ -35,7 +35,7 @@ def _should_skip_update_check(ctx: click.Context, argv: list[str]) -> bool:
 
 
 @click.group(
-    help="OpenJarvis — modular AI assistant backend",
+    help="Tradelit — modular AI assistant backend",
     invoke_without_command=True,
 )
 @click.version_option(version=openjarvis.__version__, prog_name="jarvis")

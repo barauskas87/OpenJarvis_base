@@ -247,8 +247,8 @@ def create_app(
     )
 
     app = FastAPI(
-        title="OpenJarvis API",
-        description="OpenAI-compatible API server for OpenJarvis",
+        title="Tradelit API",
+        description="OpenAI-compatible API server for Tradelit",
         version="0.1.0",
     )
 

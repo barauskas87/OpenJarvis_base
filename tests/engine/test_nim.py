@@ -133,3 +133,13 @@ def test_health_falls_back_to_models(respx_mock) -> None:
     assert engine.health() is True
     assert models.called
     engine.close()
+
+
+def test_health_false_for_hosted_endpoint_without_key(monkeypatch) -> None:
+    """The hosted catalog is public, but inference needs NIM_API_KEY."""
+    monkeypatch.delenv("NIM_API_KEY", raising=False)
+    monkeypatch.delenv("NIM_HOST", raising=False)
+    engine = NIMEngine()
+
+    assert engine.health() is False
+    engine.close()

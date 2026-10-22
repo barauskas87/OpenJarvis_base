@@ -365,11 +365,27 @@ def _reclaim_port(port: int) -> bool:
     return False
 
 
+def _port_listening(port: int) -> bool:
+    """Whether something accepts connections on *port*.
+
+    A plain bind probe also fails while recently closed connections sit in
+    TIME_WAIT (e.g. right after restarting the GUI), even though no process
+    owns the port and Vite could bind it.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
 def _check_frontend_port(port: int) -> None:
     """Reject a port already bound by another local application."""
     if _port_free(port):
         return
     if _reclaim_port(port):
+        return
+    if not _port_listening(port):
         return
     owner = _port_owner_pid(port)
     held_by = f" It is held by PID {owner}." if owner else ""
@@ -571,7 +587,7 @@ def gui(frontend_port: int, api_port: int, no_server: bool, no_browser: bool) ->
             )
         owner.refresh()
         url = f"http://127.0.0.1:{frontend_port}"
-        console.print(f"[green]OpenJarvis graphical mode is ready:[/green] {url}")
+        console.print(f"[green]Tradelit graphical mode is ready:[/green] {url}")
         if not no_browser:
             webbrowser.open(url)
 

@@ -379,9 +379,12 @@ fn project_root_near_executable(exe: &std::path::Path) -> Option<std::path::Path
         return Some(installed_checkout);
     }
 
-    // Development builds and app bundles may sit inside the checkout.
+    // Development builds and app bundles may sit inside the checkout. A
+    // bundled dev build lives at
+    // frontend/src-tauri/target/release/bundle/macos/Tradelit.app/Contents/MacOS,
+    // nine levels below the repo root.
     let mut dir = exe_dir.parent();
-    for _ in 1..8 {
+    for _ in 1..12 {
         let current = dir?;
         if current.join("pyproject.toml").is_file() {
             return Some(current.to_path_buf());
@@ -504,7 +507,7 @@ impl Default for SetupStatus {
     fn default() -> Self {
         Self {
             phase: "awaiting_source".into(),
-            detail: "Choose where OpenJarvis should run models.".into(),
+            detail: "Choose where Tradelit should run models.".into(),
             ollama_ready: false,
             server_ready: false,
             model_ready: false,

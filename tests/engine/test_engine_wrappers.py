@@ -143,3 +143,16 @@ async def test_multi_routes_stream_full_by_model():
         result_b.append(chunk)
 
     assert result_b[0].content == "from B"
+
+
+def test_multi_primary_engine_wins_duplicate_model_ids():
+    """A later engine listing the same model ID must not steal it from the primary."""
+    primary = _FakeStreamFullEngine([])
+    primary.list_models = lambda: ["openai/gpt-oss-20b"]
+
+    remote = _FakeStreamFullEngine([])
+    remote.list_models = lambda: ["openai/gpt-oss-20b", "remote-only"]
+
+    multi = MultiEngine([("lmstudio", primary), ("nim", remote)])
+    assert multi.engine_key_for("openai/gpt-oss-20b") == "lmstudio"
+    assert multi.engine_key_for("remote-only") == "nim"

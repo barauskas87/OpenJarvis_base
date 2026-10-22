@@ -35,6 +35,11 @@ class MultiEngine(InferenceEngine):
         for key, engine in self._engines:
             try:
                 for model_id in engine.list_models():
+                    # First engine wins: the primary (configured) engine is
+                    # listed first, so a remote catalog advertising the same
+                    # model ID (e.g. NIM) must not steal it.
+                    if model_id in self._model_map:
+                        continue
                     self._model_map[model_id] = engine
                     self._model_key_map[model_id] = key
             except Exception as exc:
