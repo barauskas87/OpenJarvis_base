@@ -1,0 +1,2 @@
+# traces / sessions / operators / recipes / templates / prompt / system / workflow / bench / intelligence / daemon / a2a / learning-like pequenos — ADAPTADO (ler antes)
+Cobertura [V] (só contagem de padrões, nenhum li inteiro). Sem rede, sem subprocess, sem env (exceto onde indicado na matriz). `traces` (4 arquivos) e `sessions` (3) usam SQLite local. `workflow/engine.py:278` só comenta que `eval` seria inseguro. `system/builder.py` é o "assembler" e acopla telemetria/analytics: não copiar como está.
