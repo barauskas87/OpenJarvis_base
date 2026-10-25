@@ -7,3 +7,4 @@ select = ["E", "F", "I", "W"]
 [lint.per-file-ignores]
 # Textos de teste (strings de ataque, JSON embutido) são longos de propósito.
 "Tests/*.py" = ["E501"]
+"ferramentas/*.py" = ["E501", "E402"]

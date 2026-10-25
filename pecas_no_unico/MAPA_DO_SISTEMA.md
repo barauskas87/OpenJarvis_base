@@ -16,11 +16,19 @@ comparar com o upstream.
 | `mcp/` | transporte stdio/HTTP, cliente, loader, servidor | comando e host em lista permitida |
 | `memory/`, `traces/` | fatos com revisão, rastros mascarados | |
 | `engine/`, `channels/` | cliente OpenAI-compatível, Telegram | |
+| `servidor/` | API HTTPS (FastAPI) para o app Android: token, limites, histórico por dono | ver `CONTRATO_API.md` |
+| `../android/nucleo/` | cliente HTTPS Kotlin (OkHttp): TLS fixo/pins, sem redirecionamento | testado no Gradle |
+| `../android/app/` | app Android (Compose, Keystore) | compila no CI; sem teste em aparelho |
+| `../contrato/` | exemplos e `openapi.json` lidos pelos testes dos dois lados | |
+| `ferramentas/` | servidor de teste com TLS, testes de mutação | |
 
 ## Fluxo de uma chamada de ferramenta
 limite de taxa → guarda de fronteira → capacidades (RBAC) → política de taint → confirmação →
 execução com timeout (thread) → varredura de taint/injeção na saída → mascaramento de segredos.
 
 ## Testes (`Tests/`)
-407 testes, marcados por dimensão: funcao, estabilidade, integracao, interferencia, desempenho,
+487 testes Python (+ 52 Kotlin), marcados por dimensão: funcao, estabilidade, integracao, interferencia, desempenho,
 recursividade. `pytest.ini` e `ruff.toml` na raiz.
+
+## Plataformas
+Versões previstas: Linux e Mobile (Android). Ver `PLATAFORMAS.md` (o que é portável, o que não existe no Android e a decisão pendente sobre como o app usa o Nó).

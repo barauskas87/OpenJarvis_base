@@ -5,6 +5,10 @@ croniter>=2.0          # agendador (cron)
 tzdata; sys_platform == "win32"
 cryptography>=42       # assinatura Ed25519 de skills
 tomli>=2.0; python_version < "3.11"
+# API do Nó (servidor para o app Android)
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2
 # Opcionais
 python-telegram-bot>=21   # canal Telegram
 # Somente para testes/lint

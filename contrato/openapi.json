@@ -1,0 +1,227 @@
+{
+  "components": {
+    "schemas": {
+      "RespostaConversa": {
+        "description": "Resposta de ``POST /v1/conversar``.",
+        "properties": {
+          "conversa_id": {
+            "title": "Conversa Id",
+            "type": "string"
+          },
+          "resposta": {
+            "title": "Resposta",
+            "type": "string"
+          },
+          "turnos": {
+            "title": "Turnos",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resposta",
+          "conversa_id",
+          "turnos"
+        ],
+        "title": "RespostaConversa",
+        "type": "object"
+      },
+      "RespostaErro": {
+        "description": "Formato único de erro.",
+        "properties": {
+          "erro": {
+            "title": "Erro",
+            "type": "string"
+          },
+          "mensagem": {
+            "title": "Mensagem",
+            "type": "string"
+          }
+        },
+        "required": [
+          "erro",
+          "mensagem"
+        ],
+        "title": "RespostaErro",
+        "type": "object"
+      },
+      "RespostaSaude": {
+        "description": "Resposta de ``GET /v1/saude`` (sem autenticação, sem detalhes internos).",
+        "properties": {
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "versao_api": {
+            "title": "Versao Api",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "versao_api"
+        ],
+        "title": "RespostaSaude",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Nó Único",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/conversar": {
+      "post": {
+        "operationId": "conversar_v1_conversar_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Corpo de ``POST /v1/conversar``.",
+                "properties": {
+                  "conversa_id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Conversa Id"
+                  },
+                  "mensagem": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "title": "Mensagem",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mensagem"
+                ],
+                "title": "PedidoConversa",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaConversa"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "JSON inválido"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Token ausente ou inválido"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Corpo maior que o limite"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Campos inválidos"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Limite de uso ou de tentativas"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Erro interno"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Nó ocupado"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaErro"
+                }
+              }
+            },
+            "description": "Tempo esgotado"
+          }
+        },
+        "summary": "Conversar"
+      }
+    },
+    "/v1/saude": {
+      "get": {
+        "operationId": "saude_v1_saude_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RespostaSaude"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Saude"
+      }
+    }
+  }
+}
