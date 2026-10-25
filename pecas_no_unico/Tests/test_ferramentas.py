@@ -28,7 +28,7 @@ class TestFileRead:
                 FileReadTool(allowed_dirs=invalido)  # type: ignore[arg-type]
 
     def test_le_dentro_da_area(self, area):
-        (area / "a.txt").write_text("olá\nmundo\n", encoding="utf-8")
+        (area / "a.txt").write_bytes("olá\nmundo\n".encode("utf-8"))
         r = FileReadTool([str(area)]).execute(path=str(area / "a.txt"))
         assert r.success and r.content == "olá\nmundo\n"
 
@@ -37,7 +37,7 @@ class TestFileRead:
         assert FileReadTool([str(area)]).execute(path="r.txt").content == "x"
 
     def test_max_lines(self, area):
-        (area / "l.txt").write_text("1\n2\n3\n")
+        (area / "l.txt").write_bytes(b"1\n2\n3\n")
         r = FileReadTool([str(area)]).execute(path="l.txt", max_lines=2)
         assert r.content == "1\n2\n"
 

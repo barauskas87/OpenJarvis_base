@@ -87,6 +87,9 @@ class FileReadTool(BaseTool):
             return self._negado(f"Access denied: {pedido} is a sensitive file.")
 
         # 3) leitura única, com teto, no caminho já resolvido
+        # Diretório: no Windows dá PermissionError, no Linux IsADirectoryError.
+        if resolvido.is_dir():
+            return self._negado(f"Not a file: {pedido}")
         try:
             with open(resolvido, "rb") as arquivo:
                 bruto = arquivo.read(_MAX_SIZE_BYTES + 1)

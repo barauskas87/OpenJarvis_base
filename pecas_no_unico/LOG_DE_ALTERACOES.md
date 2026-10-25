@@ -28,8 +28,14 @@ Referência dos achados: `vetting/03_segunda_passada.md` (N1–N27) e `vetting/m
 ## Removido / não copiado
 Rust, telemetria (posthog), instaladores, desktop/deploy, `repl`.
 
+## Achado pelo CI no Windows
+| Peça | Problema | Correção |
+|---|---|---|
+| tools/file_read | abrir diretório dá `PermissionError` no Windows, e a resposta era "Read error" em vez de "Not a file" | checagem `is_dir()` antes de abrir |
+| Tests/test_ferramentas | 2 testes dependiam de `\n` (Windows grava `\r\n`) | gravação em bytes |
+
 ## Verificação (2026-10-25)
-- 407 testes passando em Python 3.11, 3.12 e 3.13.
+- 407 testes passando em Python 3.10 a 3.13, Linux e Windows (CI).
 - Distribuição: funcao 12, estabilidade 58, integracao 32, interferencia 9, desempenho 4, recursividade 9 (+ testes sem marca).
 - Mutação: 33 mutações injetadas, 33 detectadas.
 - `ruff check` e `ruff format --check` limpos.

@@ -1,7 +1,8 @@
 # GUIA DE IMPLANTAÇÃO
 
-- Python 3.11, 3.12 e 3.13 testados. **3.10 não foi testado** (não havia interpretador).
-- Linux é o alvo testado. Windows: `shell_exec` e `_matar_arvore` não foram exercitados.
+- Python 3.10, 3.11, 3.12 e 3.13 testados no CI (Linux e Windows), todos verdes.
+- No Windows, 33 testes são pulados de propósito (shell POSIX, symlinks, permissões 0600).
+  Logo `shell_exec`, `_matar_arvore` e o transporte MCP stdio **não foram exercitados no Windows**.
 - Chave de assinatura de skills: gravada com permissão 0600; guarde fora do repositório.
 - Token do Telegram só por variável de ambiente; nunca em arquivo versionado.
 - Estado em `get_config_dir()` é tratado como sensível (a ferramenta de leitura de arquivos o bloqueia).
