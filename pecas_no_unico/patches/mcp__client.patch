@@ -1,0 +1,21 @@
+--- a/src/openjarvis/mcp/client.py
++++ b/src/openjarvis/mcp/client.py
+@@ -104,15 +104,14 @@
+         """
+         response = self._send("tools/list")
+         tools = response.result.get("tools", [])
+-        # MCP tools often wrap long-running pentest/scan commands. The default
+-        # ToolSpec timeout (30s) kills them mid-scan. Bump to 600s — individual
+-        # MCP servers can shorten via their own protocol if needed.
++        # Patch N20: o upstream fixava 600 s (pensado para varreduras longas).
++        # O adaptador define o timeout; aqui fica o padrão conservador.
+         return [
+             ToolSpec(
+                 name=t["name"],
+                 description=t.get("description", ""),
+                 parameters=t.get("inputSchema", {}),
+-                timeout_seconds=600.0,
++                timeout_seconds=120.0,
+             )
+             for t in tools
+         ]

@@ -1,0 +1,182 @@
+--- a/src/openjarvis/mcp/server.py
++++ b/src/openjarvis/mcp/server.py
+@@ -56,29 +56,22 @@
+ 
+     def __init__(
+         self,
+-        tools: Optional[List[BaseTool]] = None,
++        tools: List[BaseTool],
+         *,
+         bus: Optional[EventBus] = None,
+         capability_policy: Optional[Any] = None,
+         rate_limiter: Optional[Any] = None,
+         agent_id: str = _MCP_AGENT_ID,
+-        allowed_dirs: Optional[List[str]] = None,
+     ) -> None:
+-        """Create an MCP server with the same dispatch gates as other agents.
++        """Cria um servidor MCP que expõe SOMENTE as ferramentas informadas.
+ 
+-        ``agent_id`` is deliberately non-empty by default: capability policy,
+-        rate-limit and audit records must never collapse MCP traffic into the
+-        anonymous ``""`` identity.  Callers that enable a security profile
+-        pass its policy and limiter here; ``ToolExecutor`` then applies both
+-        declared and canonical built-in capability requirements before a tool
+-        can run.
+-
+-        ``allowed_dirs`` supplies the active configuration's filesystem policy
+-        to auto-discovered file tools; explicitly supplied tools keep their own
+-        constructor policy.
++        Patch N20: o upstream, sem lista, descobria e expunha tudo o que
++        estivesse registrado (inclusive ``repl`` e ``code_interpreter``). Aqui
++        a lista é obrigatória. As mesmas barreiras do ``ToolExecutor`` valem
++        (confirmação, capacidades, taint); sem política explícita, nega tudo.
+         """
+         if tools is None:
+-            tools = self._auto_discover_tools(allowed_dirs=allowed_dirs)
++            raise ValueError("MCPServer exige a lista explícita de ferramentas")
+         self._tools: Dict[str, BaseTool] = {t.spec.name: t for t in tools}
+         self._executor = ToolExecutor(
+             tools,
+@@ -88,142 +81,6 @@
+             agent_id=agent_id or _MCP_AGENT_ID,
+         )
+ 
+-    @staticmethod
+-    def _auto_discover_tools(
+-        *, allowed_dirs: Optional[List[str]] = None
+-    ) -> List[BaseTool]:
+-        """Auto-discover all built-in tools by direct import.
+-
+-        Does not rely on ToolRegistry state — imports each tool class
+-        directly and attempts instantiation with no arguments.
+-        """
+-        tools: List[BaseTool] = []
+-        _tool_classes: List[type] = []
+-
+-        # Built-in API tools
+-        try:
+-            from openjarvis.tools.calculator import CalculatorTool
+-
+-            _tool_classes.append(CalculatorTool)
+-        except ImportError:
+-            pass
+-        try:
+-            from openjarvis.tools.think import ThinkTool
+-
+-            _tool_classes.append(ThinkTool)
+-        except ImportError:
+-            pass
+-        try:
+-            from openjarvis.tools.file_read import FileReadTool
+-
+-            _tool_classes.append(FileReadTool)
+-        except ImportError:
+-            pass
+-        try:
+-            from openjarvis.tools.web_search import WebSearchTool
+-
+-            _tool_classes.append(WebSearchTool)
+-        except ImportError:
+-            pass
+-        try:
+-            from openjarvis.tools.code_interpreter import CodeInterpreterTool
+-
+-            _tool_classes.append(CodeInterpreterTool)
+-        except ImportError:
+-            pass
+-        try:
+-            from openjarvis.tools.repl import ReplTool
+-
+-            _tool_classes.append(ReplTool)
+-        except ImportError:
+-            pass
+-
+-        # Storage MCP tools
+-        try:
+-            from openjarvis.tools.storage_tools import (
+-                MemoryIndexTool,
+-                MemoryRetrieveTool,
+-                MemorySearchTool,
+-                MemoryStoreTool,
+-            )
+-
+-            _tool_classes.extend(
+-                [
+-                    MemoryStoreTool,
+-                    MemoryRetrieveTool,
+-                    MemorySearchTool,
+-                    MemoryIndexTool,
+-                ]
+-            )
+-        except ImportError:
+-            pass
+-
+-        # Channel MCP tools
+-        try:
+-            from openjarvis.tools.channel_tools import (
+-                ChannelListTool,
+-                ChannelSendTool,
+-                ChannelStatusTool,
+-            )
+-
+-            _tool_classes.extend(
+-                [
+-                    ChannelSendTool,
+-                    ChannelListTool,
+-                    ChannelStatusTool,
+-                ]
+-            )
+-        except ImportError:
+-            pass
+-
+-        # LM tool (needs engine/model — instantiate with None)
+-        try:
+-            from openjarvis.tools.llm_tool import LLMTool
+-
+-            _tool_classes.append(LLMTool)
+-        except ImportError:
+-            pass
+-
+-        # Retrieval tool (needs backend — instantiate with None)
+-        try:
+-            from openjarvis.tools.retrieval import RetrievalTool
+-
+-            _tool_classes.append(RetrievalTool)
+-        except ImportError:
+-            pass
+-
+-        for cls in _tool_classes:
+-            try:
+-                if getattr(cls, "tool_id", None) in {"file_read", "file_write"}:
+-                    tools.append(cls(allowed_dirs=allowed_dirs))
+-                else:
+-                    tools.append(cls())
+-            except Exception as exc:
+-                logger.warning("Failed to instantiate tool from %r: %s", cls, exc)
+-
+-        # Also check ToolRegistry for any user-registered tools
+-        try:
+-            from openjarvis.core.registry import ToolRegistry
+-
+-            known_names = {t.spec.name for t in tools}
+-            for key in ToolRegistry.keys():
+-                if key not in known_names:
+-                    try:
+-                        kwargs = (
+-                            {"allowed_dirs": allowed_dirs}
+-                            if key in {"file_read", "file_write"}
+-                            else {}
+-                        )
+-                        tool = ToolRegistry.create(key, **kwargs)
+-                        if isinstance(tool, BaseTool):
+-                            tools.append(tool)
+-                    except Exception as exc:
+-                        logger.warning("Failed to register user tool: %s", exc)
+-        except Exception as exc:
+-            logger.warning("Failed to discover tools from registry: %s", exc)
+-
+-        return tools
+-
+     def get_tools(self) -> List[BaseTool]:
+         """Return all tool instances (for use by SystemBuilder)."""
+         return list(self._tools.values())

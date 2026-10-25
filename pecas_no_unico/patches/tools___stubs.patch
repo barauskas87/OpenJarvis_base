@@ -1,0 +1,352 @@
+--- a/src/openjarvis/tools/_stubs.py
++++ b/src/openjarvis/tools/_stubs.py
+@@ -20,6 +20,13 @@
+ 
+ from openjarvis.core.events import EventBus, EventType
+ from openjarvis.core.types import ToolCall, ToolResult
++from openjarvis.security.capabilities import (
++    CapabilityPolicy,
++    canonical_tool_capabilities,
++)
++from openjarvis.security.injection_scanner import InjectionScanner
++from openjarvis.security.scanner import SecretScanner
++from openjarvis.security.taint import TaintSet, auto_detect_taint, check_taint
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -145,7 +152,11 @@
+     """
+ 
+     tool_id: str
+-    is_local: bool = True
++    # Patch N12: o padrão agora é False (conteúdo NÃO confiável). Só ferramentas
++    # puramente locais (cálculo, leitura de arquivo permitido) devem declarar
++    # ``is_local = True``; ferramentas MCP e skills herdam o padrão seguro e
++    # passam pelo cerco de injeção e pelo guarda de fronteira.
++    is_local: bool = False
+ 
+     @property
+     @abstractmethod
+@@ -158,12 +169,8 @@
+ 
+     def to_openai_function(self) -> Dict[str, Any]:
+         """Convert to OpenAI function-calling format."""
+-        from openjarvis.tools.description_loader import (
+-            get_tool_description_override,
+-        )
+-
+         s = self.spec
+-        desc = get_tool_description_override(s.name) or s.description
++        desc = s.description
+         return {
+             "type": "function",
+             "function": {
+@@ -203,50 +210,55 @@
+         boundary_guard: Optional[Any] = None,
+         rate_limiter: Optional[Any] = None,
+     ) -> None:
+-        self._tools: Dict[str, BaseTool] = {t.spec.name: t for t in tools}
++        # Patch N12: nome duplicado é erro. Antes o último vencia em silêncio e
++        # uma ferramenta MCP chamada "shell_exec" podia trocar a nativa (e
++        # perder a confirmação).
++        self._tools: Dict[str, BaseTool] = {}
++        for ferramenta in tools:
++            nome = ferramenta.spec.name
++            if nome in self._tools:
++                raise ValueError(f"Ferramenta duplicada: {nome!r}")
++            self._tools[nome] = ferramenta
+         self._bus = bus
+         self._interactive = interactive
+         self._confirm_callback = confirm_callback
+         self._default_timeout = default_timeout
+-        self._capability_policy = capability_policy
++        # Patch N12: sem política explícita, NEGA por padrão. Para liberar tudo
++        # é preciso pedir: CapabilityPolicy.permissiva().
++        self._capability_policy = (
++            capability_policy
++            if capability_policy is not None
++            else CapabilityPolicy(default_deny=True)
++        )
+         self._agent_id = agent_id
+         self._boundary_guard = boundary_guard
+         self._rate_limiter = rate_limiter
+-        # Running taint accumulated across this executor's tool calls. Data
+-        # detected as PII/secret in one tool's output taints every later call,
+-        # so a sink-policy violation (e.g. secret -> http_request) is caught
+-        # even though no single caller threads ``_taint`` through by hand.
+-        # Without this the taint module is present but dormant end-to-end.
+-        try:
+-            from openjarvis.security.taint import TaintSet
+-
+-            self._session_taint: Any = TaintSet()
+-        except Exception:
+-            self._session_taint = None
++        # Taint acumulado na sessão (ver agents/_stubs.begin_session).
++        self._session_taint: Any = TaintSet()
+         self._taint_lock = threading.Lock()
+-        # Scan untrusted (non-local) tool output for prompt-injection before it
+-        # is handed back to the model. Off unless the scanner imports cleanly.
+-        try:
+-            from openjarvis.security.injection_scanner import InjectionScanner
+-
+-            self._injection_scanner: Any = InjectionScanner()
+-        except Exception:
+-            self._injection_scanner = None
++        # Patch N12: sem try/except que desliga em silêncio — se o scanner não
++        # carregar, o executor nem sobe.
++        self._injection_scanner: Any = InjectionScanner()
++        # Patch N23: eventos de ferramenta saem com segredos mascarados, porque
++        # vão para o barramento, traces e auditoria.
++        self._redator = SecretScanner()
+ 
+     def begin_session(self, content: List[str] | None = None) -> None:
+-        """Reset taint for one conversation and seed it from its history."""
+-        try:
+-            from openjarvis.security.taint import TaintSet, auto_detect_taint
++        """Zera o taint de uma conversa e o semeia com o histórico dela."""
++        taint = TaintSet()
++        for texto in content or []:
++            if texto:
++                taint = taint.union(auto_detect_taint(str(texto)))
++        with self._taint_lock:
++            self._session_taint = taint
+ 
+-            taint = TaintSet()
+-            for text in content or []:
+-                if text:
+-                    taint = taint.union(auto_detect_taint(str(text)))
+-            with self._taint_lock:
+-                self._session_taint = taint
+-        except ImportError:
+-            with self._taint_lock:
+-                self._session_taint = None
++    def _redigir_valor(self, valor: Any) -> Any:
++        """Mascara segredos em qualquer estrutura JSON-izável (para eventos)."""
++        try:
++            texto = json.dumps(valor, ensure_ascii=False, default=str)
++            return json.loads(self._redator.redact(texto))
++        except (TypeError, ValueError):
++            return self._redator.redact(str(valor))
+ 
+     def execute(self, tool_call: ToolCall) -> ToolResult:
+         """Parse arguments, dispatch to tool, measure latency, emit events."""
+@@ -303,7 +315,7 @@
+                 )
+ 
+         # Boundary guard: scan external tool arguments
+-        if self._boundary_guard is not None and not getattr(tool, "is_local", True):
++        if self._boundary_guard is not None and not getattr(tool, "is_local", False):
+             try:
+                 tool_call = self._boundary_guard.check_outbound(tool_call)
+                 # Re-parse arguments after potential redaction
+@@ -328,74 +340,60 @@
+         # security floor: a missing (or accidentally weakened) ToolSpec must
+         # not turn a privileged built-in into an unguarded tool.
+         required_capabilities = list(tool.spec.required_capabilities)
+-        if self._capability_policy is not None:
+-            from openjarvis.security.capabilities import canonical_tool_capabilities
+-
+-            for cap in canonical_tool_capabilities(tool):
+-                cap_value = cap.value if hasattr(cap, "value") else cap
+-                if cap_value not in required_capabilities:
+-                    required_capabilities.append(cap_value)
+-
+-        if self._capability_policy is not None:
+-            for cap in required_capabilities:
+-                if not self._capability_policy.check(
+-                    self._agent_id,
+-                    cap,
+-                    tool_call.name,
+-                ):
+-                    if self._bus:
+-                        self._bus.publish(
+-                            EventType.CAPABILITY_DENIED,
+-                            {
+-                                "agent_id": self._agent_id,
+-                                "capability": cap,
+-                                "tool": tool_call.name,
+-                            },
+-                        )
+-                    return ToolResult(
+-                        tool_name=tool_call.name,
+-                        content=(
+-                            f"Capability '{cap}' denied for"
+-                            f" agent '{self._agent_id}'"
+-                            f" on tool '{tool_call.name}'."
+-                        ),
+-                        success=False,
++        for cap in canonical_tool_capabilities(tool):
++            cap_value = cap.value if hasattr(cap, "value") else cap
++            if cap_value not in required_capabilities:
++                required_capabilities.append(cap_value)
++
++        for cap in required_capabilities:
++            if not self._capability_policy.check(
++                self._agent_id,
++                cap,
++                tool_call.name,
++            ):
++                if self._bus:
++                    self._bus.publish(
++                        EventType.CAPABILITY_DENIED,
++                        {
++                            "agent_id": self._agent_id,
++                            "capability": cap,
++                            "tool": tool_call.name,
++                        },
+                     )
++                return ToolResult(
++                    tool_name=tool_call.name,
++                    content=(
++                        f"Capability '{cap}' denied for"
++                        f" agent '{self._agent_id}'"
++                        f" on tool '{tool_call.name}'."
++                    ),
++                    success=False,
++                )
+ 
+         # Taint checking (sink policy). The effective taint is the union of any
+         # per-call ``_taint`` and the running session taint accumulated from
+         # earlier tool outputs — so "read a secret, then http_request it out"
+         # is blocked even when no caller passes ``_taint`` explicitly.
+-        try:
+-            from openjarvis.security.taint import TaintSet, check_taint
+-
+-            call_taint = params.get("_taint") if isinstance(params, dict) else None
+-            effective = call_taint if isinstance(call_taint, TaintSet) else TaintSet()
+-            with self._taint_lock:
+-                session_taint = self._session_taint
+-            if isinstance(session_taint, TaintSet):
+-                effective = effective.union(session_taint)
+-            if effective:
+-                violation = check_taint(tool_call.name, effective)
+-                if violation:
+-                    if self._bus:
+-                        self._bus.publish(
+-                            EventType.TAINT_VIOLATION,
+-                            {
+-                                "tool": tool_call.name,
+-                                "violation": violation,
+-                            },
+-                        )
+-                    return ToolResult(
+-                        tool_name=tool_call.name,
+-                        content=f"Taint violation: {violation}",
+-                        success=False,
++        # Chave interna "_taint" nunca vem do modelo: descarta antes de tudo.
++        params.pop("_taint", None)
++        with self._taint_lock:
++            effective = self._session_taint
++        if effective:
++            violation = check_taint(tool_call.name, effective)
++            if violation:
++                if self._bus:
++                    self._bus.publish(
++                        EventType.TAINT_VIOLATION,
++                        {
++                            "tool": tool_call.name,
++                            "violation": violation,
++                        },
+                     )
+-        except ImportError:
+-            pass
+-        # Remove internal taint key before passing to tool
+-        if isinstance(params, dict):
+-            params.pop("_taint", None)
++                return ToolResult(
++                    tool_name=tool_call.name,
++                    content=f"Taint violation: {violation}",
++                    success=False,
++                )
+ 
+         # Confirmation check for sensitive tools
+         if tool.spec.requires_confirmation:
+@@ -409,7 +407,10 @@
+                     ),
+                     success=False,
+                 )
+-            prompt = f"Allow execution of tool '{tool_call.name}' with args {params}?"
++            prompt = (
++                f"Allow execution of tool '{tool_call.name}' with args "
++                f"{self._redigir_valor(params)}?"
++            )
+             if not self._confirm_callback(prompt):
+                 return ToolResult(
+                     tool_name=tool_call.name,
+@@ -426,7 +427,7 @@
+                 EventType.TOOL_CALL_START,
+                 {
+                     "tool": tool_call.name,
+-                    "arguments": params,
++                    "arguments": self._redigir_valor(params),
+                     "agent": self._agent_id,
+                 },
+             )
+@@ -470,23 +471,17 @@
+             )
+         latency = time.time() - t0
+         result.latency_seconds = latency
+-        result.metadata["arguments"] = params
++        result.metadata["arguments"] = self._redigir_valor(params)
+ 
+         # Auto-detect taints in results and fold them into the running session
+         # taint so later calls (e.g. http_request) are gated on what earlier
+         # tools surfaced.
+         if result.success:
+-            try:
+-                from openjarvis.security.taint import TaintSet, auto_detect_taint
+-
+-                detected = auto_detect_taint(result.content)
+-                if detected and detected.labels:
+-                    result.metadata["_taint"] = detected
+-                    with self._taint_lock:
+-                        if isinstance(self._session_taint, TaintSet):
+-                            self._session_taint = self._session_taint.union(detected)
+-            except ImportError:
+-                pass
++            detected = auto_detect_taint(str(result.content or ""))
++            if detected and detected.labels:
++                result.metadata["_taint"] = detected
++                with self._taint_lock:
++                    self._session_taint = self._session_taint.union(detected)
+ 
+         # Prompt-injection defense: content returned by NON-LOCAL tools is
+         # untrusted (web pages, emails, API responses). Scan it, and on a
+@@ -496,7 +491,7 @@
+             self._injection_scanner is not None
+             and result.success
+             and result.content
+-            and not getattr(tool, "is_local", True)
++            and not getattr(tool, "is_local", False)
+         ):
+             try:
+                 scan = self._injection_scanner.scan(str(result.content))
+@@ -527,7 +522,11 @@
+ 
+         # Emit end event
+         if self._bus:
+-            result_text = str(result.content)[:10240] if result.content else ""
++            result_text = (
++                self._redator.redact(str(result.content)[:10240])
++                if result.content
++                else ""
++            )
+             # Pass through ToolResult.metadata so downstream consumers
+             # (TraceCollector → TraceStep.metadata → SkillOptimizer) can
+             # see skill-tagged invocations.  Filter to JSON-serializable
+@@ -616,14 +615,10 @@
+     if not tools:
+         return "No tools available."
+ 
+-    from openjarvis.tools.description_loader import (
+-        get_tool_description_override,
+-    )
+-
+     sections: list[str] = []
+     for t in tools:
+         s = t.spec
+-        desc = get_tool_description_override(s.name) or s.description
++        desc = s.description
+         lines = [f"### {s.name}", desc]
+ 
+         if include_category and s.category:

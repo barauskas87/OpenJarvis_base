@@ -1,0 +1,562 @@
+--- a/src/openjarvis/scheduler/scheduler.py
++++ b/src/openjarvis/scheduler/scheduler.py
+@@ -1,4 +1,22 @@
+-"""Task scheduler — cron/interval/once execution with background polling."""
++"""Agendador de tarefas: cron/intervalo/uma vez, com polling em segundo plano.
++
++Patch N10 (e N11 em ``tools.py``). Diferenças em relação ao upstream:
++
++- cada tarefa vencida é REIVINDICADA antes de rodar (o próximo horário é
++  gravado primeiro). Assim uma falha, um timeout ou um fuso inválido não faz a
++  mesma tarefa rodar de novo a cada ciclo. A entrega passa a ser "no máximo
++  uma vez" por disparo; se o processo cair no meio, aquele disparo se perde;
++- a exceção de uma tarefa não aborta as demais do mesmo ciclo;
++- cada tarefa tem timeout (``task_timeout``): o ``system.ask`` roda numa thread
++  separada e, se estourar, o disparo é registrado como erro (a thread não pode
++  ser morta; fica abandonada — por isso o limite é conservador);
++- validação na criação: tipo, cron (``croniter``), ISO do "uma vez" (normalizado
++  para UTC, para a comparação de texto do banco funcionar), intervalo mínimo,
++  fuso (``zoneinfo``; no Windows exige o pacote ``tzdata``), tamanho do prompt
++  e teto de tarefas ativas;
++- resultado e erro vão para o log de execuções com segredos mascarados e
++  truncados.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -8,25 +26,29 @@
+ from dataclasses import dataclass, field
+ from datetime import datetime, timedelta, timezone
+ from typing import Any, Dict, List, Optional
+-from zoneinfo import ZoneInfo
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
+ from openjarvis.scheduler.store import SchedulerStore
++from openjarvis.security.scanner import SecretScanner
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Event type strings (avoids editing core EventType enum)
+ SCHEDULER_TASK_START = "scheduler_task_start"
+ SCHEDULER_TASK_END = "scheduler_task_end"
+ 
++_TIPOS = ("cron", "interval", "once")
++_MAX_PROMPT = 4000
++_MAX_RESULTADO = 10_000
++
+ 
+ @dataclass(slots=True)
+ class ScheduledTask:
+-    """A task scheduled for future or recurring execution."""
++    """Uma tarefa agendada (única ou recorrente)."""
+ 
+     id: str
+     prompt: str
+     schedule_type: str  # "cron" | "interval" | "once"
+-    schedule_value: str  # cron expression, interval seconds, ISO datetime
++    schedule_value: str  # expressão cron, segundos ou data ISO
+     context_mode: str = "isolated"
+     status: str = "active"
+     next_run: Optional[str] = None
+@@ -36,7 +58,6 @@
+     metadata: Dict[str, Any] = field(default_factory=dict)
+ 
+     def to_dict(self) -> Dict[str, Any]:
+-        """Serialize to a plain dict for store persistence."""
+         return {
+             "id": self.id,
+             "prompt": self.prompt,
+@@ -52,8 +73,7 @@
+         }
+ 
+     @classmethod
+-    def from_dict(cls, d: Dict[str, Any]) -> ScheduledTask:
+-        """Deserialize from a plain dict."""
++    def from_dict(cls, d: Dict[str, Any]) -> "ScheduledTask":
+         return cls(
+             id=d["id"],
+             prompt=d["prompt"],
+@@ -70,24 +90,36 @@
+ 
+ 
+ def _now_iso() -> str:
+-    """Return current UTC time as ISO 8601 string."""
++    """Agora em UTC, formato ISO 8601."""
+     return datetime.now(timezone.utc).isoformat()
+ 
+ 
+-class TaskScheduler:
+-    """Scheduler that polls for due tasks and executes them.
++def _para_utc_iso(valor: str) -> str:
++    """Converte uma data ISO (com ou sem fuso; ``Z`` aceito) para UTC ISO.
+ 
+-    Parameters
+-    ----------
+-    store:
+-        The persistence backend.
+-    system:
+-        Optional ``JarvisSystem`` instance for executing prompts.
+-    poll_interval:
+-        Seconds between poll cycles (default 60).
+-    bus:
+-        Optional event bus for publishing scheduler events.
++    Sem fuso informado, assume UTC. Levanta ``ValueError`` se inválida.
+     """
++    texto = valor.strip()
++    if texto.endswith(("Z", "z")):
++        texto = texto[:-1] + "+00:00"
++    momento = datetime.fromisoformat(texto)
++    if momento.tzinfo is None:
++        momento = momento.replace(tzinfo=timezone.utc)
++    return momento.astimezone(timezone.utc).isoformat()
++
++
++def _normalizar_fuso(nome: str) -> ZoneInfo:
++    try:
++        return ZoneInfo(nome)
++    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
++        raise ValueError(
++            f"Fuso horário inválido ou indisponível: {nome!r}. "
++            "No Windows instale o pacote 'tzdata'."
++        ) from exc
++
++
++class TaskScheduler:
++    """Agendador que consulta tarefas vencidas e as executa."""
+ 
+     def __init__(
+         self,
+@@ -96,19 +128,26 @@
+         *,
+         poll_interval: int = 60,
+         bus: Any = None,
++        task_timeout: float = 600.0,
++        min_interval_seconds: float = 60.0,
++        max_active_tasks: int = 50,
+     ) -> None:
+         self._store = store
+         self._system = system
+         self._poll_interval = poll_interval
+         self._bus = bus
++        self._task_timeout = task_timeout
++        self._min_interval = min_interval_seconds
++        self._max_active = max_active_tasks
+         self._stop_event = threading.Event()
+         self._thread: Optional[threading.Thread] = None
+         self._lock = threading.Lock()
++        self._redator = SecretScanner()
+ 
+-    # -- Public API ----------------------------------------------------------
++    # -- API pública ----------------------------------------------------------
+ 
+     def start(self) -> None:
+-        """Start the background polling daemon thread."""
++        """Inicia a thread de polling (idempotente)."""
+         if self._thread is not None and self._thread.is_alive():
+             return
+         self._stop_event.clear()
+@@ -119,13 +158,50 @@
+         logger.info("Scheduler started (poll_interval=%ds)", self._poll_interval)
+ 
+     def stop(self) -> None:
+-        """Signal the background thread to stop and wait for it."""
++        """Pede parada e espera a thread."""
+         self._stop_event.set()
+         if self._thread is not None:
+             self._thread.join(timeout=self._poll_interval + 5)
+             self._thread = None
+         logger.info("Scheduler stopped")
+ 
++    def _validar(
++        self,
++        prompt: str,
++        schedule_type: str,
++        schedule_value: str,
++        metadata: Dict[str, Any],
++    ) -> str:
++        """Valida os dados e devolve o ``schedule_value`` normalizado."""
++        if not isinstance(prompt, str) or not prompt.strip():
++            raise ValueError("prompt vazio")
++        if len(prompt) > _MAX_PROMPT:
++            raise ValueError(f"prompt maior que {_MAX_PROMPT} caracteres")
++        if schedule_type not in _TIPOS:
++            raise ValueError(f"schedule_type deve ser um de {_TIPOS}")
++        valor = str(schedule_value).strip()
++        fuso = (metadata or {}).get("timezone")
++        if fuso:
++            _normalizar_fuso(str(fuso))
++        if schedule_type == "interval":
++            try:
++                segundos = float(valor)
++            except ValueError as exc:
++                raise ValueError("intervalo deve ser um número de segundos") from exc
++            if segundos < self._min_interval:
++                raise ValueError(f"intervalo mínimo é {self._min_interval:.0f}s")
++            return str(segundos)
++        if schedule_type == "cron":
++            from croniter import croniter
++
++            if not croniter.is_valid(valor):
++                raise ValueError(f"expressão cron inválida: {valor!r}")
++            return valor
++        try:
++            return _para_utc_iso(valor)
++        except ValueError as exc:
++            raise ValueError(f"data ISO inválida: {valor!r}") from exc
++
+     def create_task(
+         self,
+         prompt: str,
+@@ -133,176 +209,197 @@
+         schedule_value: str,
+         **kwargs: Any,
+     ) -> ScheduledTask:
+-        """Create and persist a new scheduled task."""
+-        task = ScheduledTask(
+-            id=uuid.uuid4().hex[:16],
+-            prompt=prompt,
+-            schedule_type=schedule_type,
+-            schedule_value=schedule_value,
+-            agent=kwargs.get("agent", "simple"),
+-            tools=kwargs.get("tools", ""),
+-            context_mode=kwargs.get("context_mode", "isolated"),
+-            metadata=kwargs.get("metadata", {}),
+-        )
+-        task.next_run = self._compute_next_run(task)
++        """Valida, calcula o primeiro disparo e persiste a tarefa."""
++        metadata = kwargs.get("metadata", {}) or {}
++        valor = self._validar(prompt, schedule_type, schedule_value, metadata)
+         with self._lock:
+-            self._store.save_task(task.to_dict())
+-        return task
++            ativas = len(self._store.list_tasks(status="active"))
++            if ativas >= self._max_active:
++                raise ValueError(f"limite de {self._max_active} tarefas ativas")
++            tarefa = ScheduledTask(
++                id=uuid.uuid4().hex[:16],
++                prompt=prompt,
++                schedule_type=schedule_type,
++                schedule_value=valor,
++                agent=kwargs.get("agent", "simple"),
++                tools=kwargs.get("tools", ""),
++                context_mode=kwargs.get("context_mode", "isolated"),
++                metadata=metadata,
++            )
++            tarefa.next_run = self._compute_next_run(tarefa)
++            self._store.save_task(tarefa.to_dict())
++        return tarefa
+ 
+     def list_tasks(self, *, status: Optional[str] = None) -> List[ScheduledTask]:
+-        """Return tasks, optionally filtered by *status*."""
+         with self._lock:
+-            rows = self._store.list_tasks(status=status)
+-        return [ScheduledTask.from_dict(r) for r in rows]
++            linhas = self._store.list_tasks(status=status)
++        return [ScheduledTask.from_dict(r) for r in linhas]
+ 
+-    def pause_task(self, task_id: str) -> None:
+-        """Pause an active task."""
++    def _alterar_status(self, task_id: str, status: str) -> None:
+         with self._lock:
+             d = self._store.get_task(task_id)
+             if d is None:
+                 raise KeyError(f"Task not found: {task_id}")
+-            d["status"] = "paused"
++            d["status"] = status
++            if status == "active":
++                d["next_run"] = self._compute_next_run(ScheduledTask.from_dict(d))
++            elif status == "cancelled":
++                d["next_run"] = None
+             self._store.update_task(d)
+ 
++    def pause_task(self, task_id: str) -> None:
++        self._alterar_status(task_id, "paused")
++
+     def resume_task(self, task_id: str) -> None:
+-        """Resume a paused task."""
+-        with self._lock:
+-            d = self._store.get_task(task_id)
+-            if d is None:
+-                raise KeyError(f"Task not found: {task_id}")
+-            d["status"] = "active"
+-            # Recompute next_run from now
+-            task = ScheduledTask.from_dict(d)
+-            task.next_run = self._compute_next_run(task)
+-            self._store.update_task(task.to_dict())
++        self._alterar_status(task_id, "active")
+ 
+     def cancel_task(self, task_id: str) -> None:
+-        """Cancel a task (sets status to cancelled)."""
+-        with self._lock:
+-            d = self._store.get_task(task_id)
+-            if d is None:
+-                raise KeyError(f"Task not found: {task_id}")
+-            d["status"] = "cancelled"
+-            d["next_run"] = None
+-            self._store.update_task(d)
++        self._alterar_status(task_id, "cancelled")
+ 
+-    # -- Background loop -----------------------------------------------------
++    # -- laço de polling ---------------------------------------------------
+ 
+     def _poll_loop(self) -> None:
+-        """Poll for due tasks and execute them until stopped."""
+         while not self._stop_event.is_set():
+             try:
+-                now = _now_iso()
+                 with self._lock:
+-                    due = self._store.get_due_tasks(now)
+-                for task_dict in due:
+-                    task = ScheduledTask.from_dict(task_dict)
+-                    self._execute_task(task)
+-            except Exception:
++                    vencidas = self._store.get_due_tasks(_now_iso())
++            except Exception:  # noqa: BLE001
+                 logger.exception("Scheduler poll error")
++                vencidas = []
++            for linha in vencidas:
++                if self._stop_event.is_set():
++                    break
++                try:
++                    self._execute_task(ScheduledTask.from_dict(linha))
++                except Exception:  # noqa: BLE001 — uma tarefa ruim não aborta as outras
++                    logger.exception("Falha ao executar tarefa %s", linha.get("id"))
+             self._stop_event.wait(timeout=self._poll_interval)
+ 
+-    def _execute_task(self, task: ScheduledTask) -> None:
+-        """Execute a single due task and log the result."""
+-        started_at = _now_iso()
++    def _reivindicar(self, tarefa: ScheduledTask) -> bool:
++        """Grava o próximo disparo ANTES de executar. False se já não vale."""
++        with self._lock:
++            d = self._store.get_task(tarefa.id)
++            if d is None or d.get("status") != "active":
++                return False
++            agora = _now_iso()
++            d["last_run"] = agora
++            atual = ScheduledTask.from_dict(d)
++            try:
++                proximo = self._compute_next_run(atual)
++            except Exception:  # noqa: BLE001 — fuso/cron corrompido
++                logger.exception(
++                    "Tarefa %s com agendamento inválido; pausada", tarefa.id
++                )
++                d["status"] = "paused"
++                d["next_run"] = None
++                self._store.update_task(d)
++                return False
++            d["next_run"] = proximo
++            if proximo is None:
++                d["status"] = "running"  # "uma vez": conclui depois da execução
++            self._store.update_task(d)
++        return True
++
++    def _perguntar_com_timeout(self, prompt: str, kwargs: Dict[str, Any]) -> str:
++        """Roda ``system.ask`` numa thread e desiste depois de ``task_timeout``."""
++        caixa: Dict[str, Any] = {}
+ 
+-        # Publish start event
++        def alvo() -> None:
++            try:
++                caixa["ok"] = self._system.ask(prompt, **kwargs)
++            except BaseException as exc:  # noqa: BLE001
++                caixa["erro"] = exc
++
++        thread = threading.Thread(target=alvo, daemon=True, name="jarvis-task")
++        thread.start()
++        thread.join(self._task_timeout)
++        if thread.is_alive():
++            raise TimeoutError(f"tarefa excedeu {self._task_timeout:.0f}s")
++        if "erro" in caixa:
++            raise caixa["erro"]
++        return str(caixa.get("ok", ""))
++
++    def _limpar(self, texto: str) -> str:
++        return self._redator.redact(texto)[:_MAX_RESULTADO]
++
++    def _execute_task(self, tarefa: ScheduledTask) -> None:
++        """Executa uma tarefa vencida e registra o resultado."""
++        if not self._reivindicar(tarefa):
++            return
++        inicio = _now_iso()
+         if self._bus is not None:
+             self._bus.publish(
+-                SCHEDULER_TASK_START,
+-                {"task_id": task.id, "prompt": task.prompt},
++                SCHEDULER_TASK_START, {"task_id": tarefa.id, "prompt": tarefa.prompt}
+             )
+ 
+-        success = False
+-        result_text = ""
+-        error_text = ""
+-
++        sucesso, resultado, erro = False, "", ""
+         try:
+             if self._system is not None:
+-                raw_tools = (
+-                    task.tools
+-                    if isinstance(task.tools, list)
+-                    else task.tools.split(",")
+-                )
+-                tools_list = (
+-                    [t.strip() for t in raw_tools if t.strip()] if task.tools else []
++                bruto = (
++                    tarefa.tools
++                    if isinstance(tarefa.tools, list)
++                    else str(tarefa.tools).split(",")
+                 )
+-                ask_kwargs: Dict[str, Any] = {
+-                    "agent": task.agent,
+-                    "tools": tools_list if tools_list else None,
++                ferramentas = [t.strip() for t in bruto if t.strip()]
++                kwargs: Dict[str, Any] = {
++                    "agent": tarefa.agent,
++                    "tools": ferramentas or None,
+                 }
+-                meta = task.metadata or {}
++                meta = tarefa.metadata or {}
+                 if meta.get("operator_id"):
+-                    ask_kwargs["system_prompt"] = meta.get("system_prompt", "")
+-                    ask_kwargs["operator_id"] = meta["operator_id"]
+-                result_text = self._system.ask(
+-                    task.prompt,
+-                    **ask_kwargs,
+-                )
++                    kwargs["system_prompt"] = meta.get("system_prompt", "")
++                    kwargs["operator_id"] = meta["operator_id"]
++                resultado = self._perguntar_com_timeout(tarefa.prompt, kwargs)
+             else:
+-                result_text = f"[dry-run] Would execute: {task.prompt}"
+-            success = True
+-        except Exception as exc:
+-            error_text = str(exc)
+-            logger.error("Task %s failed: %s", task.id, exc)
+-
+-        finished_at = _now_iso()
++                resultado = f"[dry-run] Would execute: {tarefa.prompt}"
++            sucesso = True
++        except Exception as exc:  # noqa: BLE001
++            erro = f"{exc.__class__.__name__}: {exc}"
++            logger.error("Task %s failed: %s", tarefa.id, erro)
+ 
+-        # Log the run
++        fim = _now_iso()
+         with self._lock:
+             self._store.log_run(
+-                task_id=task.id,
+-                started_at=started_at,
+-                finished_at=finished_at,
+-                success=success,
+-                result=result_text,
+-                error=error_text,
++                task_id=tarefa.id,
++                started_at=inicio,
++                finished_at=fim,
++                success=sucesso,
++                result=self._limpar(resultado),
++                error=self._limpar(erro),
+             )
+-
+-            # Update task state
+-            d = self._store.get_task(task.id)
+-            if d is not None:
+-                d["last_run"] = finished_at
+-                next_run = self._compute_next_run(ScheduledTask.from_dict(d))
+-                d["next_run"] = next_run
+-                if next_run is None:
+-                    d["status"] = "completed"
++            d = self._store.get_task(tarefa.id)
++            if d is not None and d.get("status") == "running":
++                d["status"] = "completed"
+                 self._store.update_task(d)
+ 
+-        # Publish end event
+         if self._bus is not None:
+             self._bus.publish(
+                 SCHEDULER_TASK_END,
+                 {
+-                    "task_id": task.id,
+-                    "success": success,
+-                    "result": result_text,
+-                    "error": error_text,
++                    "task_id": tarefa.id,
++                    "success": sucesso,
++                    "result": self._limpar(resultado),
++                    "error": self._limpar(erro),
+                 },
+             )
+ 
+-    def _compute_next_run(self, task: ScheduledTask) -> Optional[str]:
+-        """Compute the next run time for a task.
++    # -- cálculo do próximo disparo -------------------------------------------
+ 
+-        Returns an ISO 8601 string, or ``None`` if the task should not run again.
+-        """
+-        now = datetime.now(timezone.utc)
+-
+-        if task.schedule_type == "once":
+-            # If already run, no more runs
+-            if task.last_run is not None:
++    def _compute_next_run(self, tarefa: ScheduledTask) -> Optional[str]:
++        """Próximo disparo em UTC ISO, ou ``None`` se não deve rodar de novo."""
++        agora = datetime.now(timezone.utc)
++
++        if tarefa.schedule_type == "once":
++            if tarefa.last_run is not None:
+                 return None
+-            # Otherwise the schedule_value is the target ISO datetime
+-            return task.schedule_value
++            return _para_utc_iso(tarefa.schedule_value)
++
++        if tarefa.schedule_type == "interval":
++            return (agora + timedelta(seconds=float(tarefa.schedule_value))).isoformat()
+ 
+-        if task.schedule_type == "interval":
+-            seconds = float(task.schedule_value)
+-            next_time = now + timedelta(seconds=seconds)
+-            return next_time.isoformat()
+-
+-        if task.schedule_type == "cron":
+-            timezone_name = str((task.metadata or {}).get("timezone") or "") or None
+-            return self._compute_next_cron(task.schedule_value, now, timezone_name)
++        if tarefa.schedule_type == "cron":
++            fuso = str((tarefa.metadata or {}).get("timezone") or "") or None
++            return self._compute_next_cron(tarefa.schedule_value, agora, fuso)
+ 
+         return None
+ 
+@@ -312,25 +409,18 @@
+         now: datetime,
+         timezone_name: str | None = None,
+     ) -> Optional[str]:
+-        """Compute the next run time from a cron expression.
+-
+-        Evaluate in the configured IANA timezone and persist the result in UTC.
+-        Missing cron support is fatal instead of silently changing semantics.
+-        """
+-        try:
+-            from croniter import croniter  # type: ignore[import-untyped]
+-        except ImportError as exc:
+-            raise RuntimeError(
+-                "croniter is required for cron schedules; reinstall OpenJarvis"
+-            ) from exc
++        """Próximo disparo cron, avaliado no fuso informado e gravado em UTC."""
++        from croniter import croniter
+ 
+         if now.tzinfo is None:
+             now = now.replace(tzinfo=timezone.utc)
+-        local_now = now.astimezone(ZoneInfo(timezone_name)) if timezone_name else now
+-        next_local = croniter(cron_expr, local_now).get_next(datetime)
+-        if next_local.tzinfo is None:
+-            next_local = next_local.replace(tzinfo=local_now.tzinfo)
+-        return next_local.astimezone(timezone.utc).isoformat()
++        local = (
++            now.astimezone(_normalizar_fuso(timezone_name)) if timezone_name else now
++        )
++        proximo = croniter(cron_expr, local).get_next(datetime)
++        if proximo.tzinfo is None:
++            proximo = proximo.replace(tzinfo=local.tzinfo)
++        return proximo.astimezone(timezone.utc).isoformat()
+ 
+ 
+ __all__ = [

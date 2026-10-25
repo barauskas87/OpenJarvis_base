@@ -1,0 +1,183 @@
+--- a/src/openjarvis/scheduler/tools.py
++++ b/src/openjarvis/scheduler/tools.py
+@@ -3,20 +3,46 @@
+ from __future__ import annotations
+ 
+ import json
+-from typing import Any, Optional
++from typing import Any, Iterable, Optional
+ 
+ from openjarvis.core.registry import ToolRegistry
+ from openjarvis.core.types import ToolResult
++from openjarvis.security.injection_scanner import InjectionScanner
++from openjarvis.security.scanner import SecretScanner
++from openjarvis.security.types import ThreatLevel
+ from openjarvis.tools._stubs import BaseTool, ToolSpec
+ 
+ 
+ @ToolRegistry.register("schedule_task")
+ class ScheduleTaskTool(BaseTool):
+-    """Schedule a new task for future or recurring execution."""
++    """Agenda uma tarefa futura ou recorrente.
++
++    Patch N11: no upstream o modelo podia agendar sem confirmação, escolhendo
++    ``prompt``, ``agent`` e ``tools``; uma injeção de prompt virava execução
++    recorrente persistente. Aqui:
++
++    - exige confirmação humana e a capacidade ``schedule:create``;
++    - ``agent`` e ``tools`` só podem ser os liberados no construtor (padrão:
++      agente ``simple`` e nenhuma ferramenta);
++    - o prompt é recusado se tiver segredo ou injeção grave.
++    """
+ 
+     tool_id = "schedule_task"
+     _scheduler: Optional[Any] = None
+ 
++    def __init__(
++        self,
++        scheduler: Optional[Any] = None,
++        *,
++        agentes_permitidos: Iterable[str] = ("simple",),
++        ferramentas_permitidas: Iterable[str] = (),
++    ) -> None:
++        self._scheduler = scheduler
++        self._agentes_permitidos = frozenset(agentes_permitidos)
++        self._ferramentas_permitidas = frozenset(ferramentas_permitidas)
++        self._injecao = InjectionScanner()
++        self._segredos = SecretScanner()
++
+     @property
+     def spec(self) -> ToolSpec:
+         return ToolSpec(
+@@ -24,7 +50,7 @@
+             description=(
+                 "Schedule a task for future or recurring execution. "
+                 "Supports cron expressions, interval (seconds), or "
+-                "one-time ISO datetime scheduling."
++                "one-time ISO datetime scheduling. Requires user confirmation."
+             ),
+             parameters={
+                 "type": "object",
+@@ -35,9 +61,7 @@
+                     },
+                     "schedule_type": {
+                         "type": "string",
+-                        "description": (
+-                            "Schedule type: 'cron', 'interval', or 'once'."
+-                        ),
++                        "description": "Schedule type: 'cron', 'interval', or 'once'.",
+                         "enum": ["cron", "interval", "once"],
+                     },
+                     "schedule_value": {
+@@ -53,61 +77,75 @@
+                     },
+                     "tools": {
+                         "type": "string",
+-                        "description": (
+-                            "Comma-separated tool names for agent "
+-                            "(e.g. 'calculator,think')."
+-                        ),
++                        "description": "Comma-separated tool names for the agent.",
+                     },
+                 },
+                 "required": ["prompt", "schedule_type", "schedule_value"],
+             },
+             category="scheduler",
++            requires_confirmation=True,
++            required_capabilities=["schedule:create"],
+         )
+ 
++    @staticmethod
++    def _falha(mensagem: str) -> ToolResult:
++        return ToolResult(tool_name="schedule_task", content=mensagem, success=False)
++
+     def execute(self, **params: Any) -> ToolResult:
+         if self._scheduler is None:
+-            return ToolResult(
+-                tool_name="schedule_task",
+-                content="Scheduler not available. Cannot schedule tasks.",
+-                success=False,
+-            )
++            return self._falha("Scheduler not available. Cannot schedule tasks.")
+         prompt = params.get("prompt", "")
+         schedule_type = params.get("schedule_type", "")
+         schedule_value = params.get("schedule_value", "")
+         if not prompt or not schedule_type or not schedule_value:
+-            return ToolResult(
+-                tool_name="schedule_task",
+-                content=(
+-                    "Missing required parameters:"
+-                    " prompt, schedule_type, schedule_value."
+-                ),
+-                success=False,
++            return self._falha(
++                "Missing required parameters: prompt, schedule_type, schedule_value."
+             )
++
++        agente = str(params.get("agent") or "simple")
++        if agente not in self._agentes_permitidos:
++            return self._falha(f"Agent not allowed for scheduled tasks: {agente}")
++
++        bruto = params.get("tools") or ""
++        pedidas = (
++            [str(t).strip() for t in bruto if str(t).strip()]
++            if isinstance(bruto, list)
++            else [t.strip() for t in str(bruto).split(",") if t.strip()]
++        )
++        negadas = [t for t in pedidas if t not in self._ferramentas_permitidas]
++        if negadas:
++            return self._falha(f"Tools not allowed for scheduled tasks: {negadas}")
++
++        if self._segredos.scan(str(prompt)).findings:
++            return self._falha("Prompt contains secrets or credentials; refused.")
++        analise = self._injecao.scan(str(prompt))
++        if not analise.is_clean and analise.threat_level in (
++            ThreatLevel.HIGH,
++            ThreatLevel.CRITICAL,
++        ):
++            return self._falha("Prompt looks like a prompt injection; refused.")
++
+         try:
+-            task = self._scheduler.create_task(
++            tarefa = self._scheduler.create_task(
+                 prompt=prompt,
+                 schedule_type=schedule_type,
+                 schedule_value=schedule_value,
+-                agent=params.get("agent", "simple"),
+-                tools=params.get("tools", ""),
+-            )
+-            return ToolResult(
+-                tool_name="schedule_task",
+-                content=json.dumps(
+-                    {
+-                        "task_id": task.id,
+-                        "next_run": task.next_run,
+-                        "status": task.status,
+-                    }
+-                ),
+-                success=True,
+-            )
+-        except Exception as exc:
+-            return ToolResult(
+-                tool_name="schedule_task",
+-                content=f"Failed to schedule task: {exc}",
+-                success=False,
++                agent=agente,
++                tools=",".join(pedidas),
+             )
++        except Exception as exc:  # noqa: BLE001 — erro de validação vira resultado
++            return self._falha(f"Failed to schedule task: {exc}")
++        return ToolResult(
++            tool_name="schedule_task",
++            content=json.dumps(
++                {
++                    "task_id": tarefa.id,
++                    "next_run": tarefa.next_run,
++                    "status": tarefa.status,
++                }
++            ),
++            success=True,
++        )
+ 
+ 
+ @ToolRegistry.register("list_scheduled_tasks")

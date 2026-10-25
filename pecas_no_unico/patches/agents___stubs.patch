@@ -1,0 +1,172 @@
+--- a/src/openjarvis/agents/_stubs.py
++++ b/src/openjarvis/agents/_stubs.py
+@@ -13,7 +13,6 @@
+ from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Optional
+ 
+-from openjarvis.core.config import load_config
+ from openjarvis.core.events import EventBus, EventType
+ from openjarvis.core.types import Conversation, Message, Role, ToolResult
+ from openjarvis.engine._stubs import InferenceEngine
+@@ -89,80 +88,24 @@
+         self._rate_limiter = rate_limiter
+         self._runtime_agent_id = agent_id or getattr(self, "agent_id", "")
+ 
+-        # Three-tier resolution: explicit arg > config > class default > hardcoded
+-        if temperature is not None and max_tokens is not None:
+-            self._temperature = temperature
+-            self._max_tokens = max_tokens
+-        else:
+-            try:
+-                cfg = load_config()
+-                self._temperature = (
+-                    temperature
+-                    if temperature is not None
+-                    else cfg.intelligence.temperature
+-                )
+-                self._max_tokens = (
+-                    max_tokens
+-                    if max_tokens is not None
+-                    else cfg.intelligence.max_tokens
+-                )
+-            except Exception:
+-                self._temperature = (
+-                    temperature
+-                    if temperature is not None
+-                    else getattr(self, "_default_temperature", 0.7)
+-                )
+-                self._max_tokens = (
+-                    max_tokens
+-                    if max_tokens is not None
+-                    else getattr(self, "_default_max_tokens", 1024)
+-                )
++        # Patch N14: sem ``load_config()``. O upstream lia ~/.openjarvis/config.toml
++        # (e importava o config.py inteiro, 2000+ linhas) a cada agente criado.
++        # Aqui: argumento explícito > padrão da classe > padrão fixo.
++        self._temperature = (
++            temperature
++            if temperature is not None
++            else getattr(self, "_default_temperature", 0.7)
++        )
++        self._max_tokens = (
++            max_tokens
++            if max_tokens is not None
++            else getattr(self, "_default_max_tokens", 1024)
++        )
+ 
+     # ------------------------------------------------------------------
+     # Concrete helpers
+     # ------------------------------------------------------------------
+ 
+-    def _execution_denied_result(
+-        self,
+-        required_capabilities: Optional[List[str]] = None,
+-        *,
+-        operation: str = "agent_run",
+-    ) -> Optional[AgentResult]:
+-        """Return a denial result when a direct agent operation is forbidden."""
+-        required = list(
+-            required_capabilities
+-            if required_capabilities is not None
+-            else self.required_capabilities
+-        )
+-        if not required:
+-            return None
+-        result = self._authorize_direct_operation(required, operation=operation)
+-        if result.success:
+-            return None
+-        return AgentResult(
+-            content=result.content,
+-            tool_results=[result],
+-            metadata={"error": True, "security_denied": True},
+-        )
+-
+-    def _authorize_direct_operation(
+-        self,
+-        required_capabilities: List[str],
+-        *,
+-        operation: str,
+-    ) -> ToolResult:
+-        """Authorize a non-BaseTool operation using this runtime identity."""
+-        from openjarvis.security.runtime import authorize_secured_operation
+-
+-        return authorize_secured_operation(
+-            operation,
+-            required_capabilities,
+-            bus=self._bus,
+-            capability_policy=self._capability_policy,
+-            rate_limiter=self._rate_limiter,
+-            agent_id=self._runtime_agent_id,
+-        )
+-
+     def _emit_turn_start(self, input: str) -> None:
+         """Publish ``AGENT_TURN_START`` if an event bus is available."""
+         if self._bus:
+@@ -225,12 +168,7 @@
+         elif _context_has_system:
+             effective_system_prompt = None
+         else:
+-            # Fall back to the config-level default (grounds local models)
+-            try:
+-                cfg = load_config()
+-                effective_system_prompt = cfg.agent.default_system_prompt or None
+-            except Exception:
+-                effective_system_prompt = None
++            effective_system_prompt = None
+         # Fold ALL in-context system messages (both auto-captured memory
+         # context and caller-supplied system messages) into one leading system
+         # message. Do this even when there is no independently-built prompt:
+@@ -421,6 +359,7 @@
+         confirm_callback: Optional[Any] = None,
+         skill_few_shot_examples: Optional[List[str]] = None,
+         prompt_builder: Optional[Any] = None,
++        boundary_guard: Optional[Any] = None,
+     ) -> None:
+         super().__init__(
+             engine,
+@@ -448,30 +387,26 @@
+             interactive=interactive,
+             confirm_callback=confirm_callback,
+             rate_limiter=rate_limiter,
++            # Patch N12: o upstream nunca repassava o guarda de fronteira.
++            boundary_guard=boundary_guard,
++        )
++        # max_turns: argumento explícito > padrão da classe > 10
++        self._max_turns = (
++            max_turns
++            if max_turns is not None
++            else getattr(self, "_default_max_turns", 10)
+         )
+-        # Resolve max_turns: explicit arg > config > class default > 10
+-        if max_turns is not None:
+-            self._max_turns = max_turns
+-        else:
+-            try:
+-                cfg = load_config()
+-                self._max_turns = cfg.agent.max_turns
+-            except Exception:
+-                self._max_turns = getattr(self, "_default_max_turns", 10)
+ 
+         # Loop guard
+         self._loop_guard = None
+-        try:
+-            from openjarvis.agents.loop_guard import LoopGuard, LoopGuardConfig
++        from openjarvis.agents.loop_guard import LoopGuard, LoopGuardConfig
+ 
+-            if loop_guard_config is None:
+-                loop_guard_config = LoopGuardConfig()
+-            elif isinstance(loop_guard_config, dict):
+-                loop_guard_config = LoopGuardConfig(**loop_guard_config)
+-            if loop_guard_config.enabled:
+-                self._loop_guard = LoopGuard(loop_guard_config, bus=bus)
+-        except ImportError:
+-            pass
++        if loop_guard_config is None:
++            loop_guard_config = LoopGuardConfig()
++        elif isinstance(loop_guard_config, dict):
++            loop_guard_config = LoopGuardConfig(**loop_guard_config)
++        if loop_guard_config.enabled:
++            self._loop_guard = LoopGuard(loop_guard_config, bus=bus)
+ 
+     def _emit_turn_start(self, input: str) -> None:
+         # A ToolUsingAgent instance may serve many unrelated requests. Start

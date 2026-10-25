@@ -1,0 +1,38 @@
+--- a/src/openjarvis/skills/dependency.py
++++ b/src/openjarvis/skills/dependency.py
+@@ -21,7 +21,15 @@
+ 
+ 
+ class DepthExceededError(Exception):
+-    """Raised when the dependency depth exceeds the configured maximum."""
++    """Raised when the dependency depth exceeds the configured maximum.
++
++    Patch N6: carrega as skills que estouram o limite, para o gerenciador
++    removê-las sem derrubar a descoberta inteira.
++    """
++
++    def __init__(self, message: str, skills: Optional[Set[str]] = None) -> None:
++        super().__init__(message)
++        self.skills: Set[str] = skills if skills is not None else set()
+ 
+ 
+ def build_dependency_graph(skills: Dict[str, "SkillManifest"]) -> Dict[str, Set[str]]:
+@@ -131,12 +139,12 @@
+         depth_cache[name] = result
+         return result
+ 
+-    for name in graph:
+-        d = _depth(name, set())
+-        if d > max_depth:
+-            raise DepthExceededError(
+-                f"Skill '{name}' depth {d} exceeds max_depth={max_depth}"
+-            )
++    excedidas = {name for name in graph if _depth(name, set()) > max_depth}
++    if excedidas:
++        raise DepthExceededError(
++            f"Skills {sorted(excedidas)} exceed max_depth={max_depth}",
++            skills=excedidas,
++        )
+ 
+     return order
+ 

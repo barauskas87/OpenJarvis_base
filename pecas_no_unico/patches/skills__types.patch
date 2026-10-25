@@ -1,0 +1,35 @@
+--- a/src/openjarvis/skills/types.py
++++ b/src/openjarvis/skills/types.py
+@@ -35,10 +35,17 @@
+     markdown_content: str = ""  # loaded from SKILL.md
+ 
+     def manifest_bytes(self) -> bytes:
+-        """Serialize the manifest (excluding signature) for signing/verification."""
++        """Serializa o manifesto (sem a assinatura) para assinar/verificar.
++
++        Patch N1: o upstream NÃO assinava ``markdown_content`` (o corpo do
++        SKILL.md, que vira instrução para o modelo), nem ``metadata``,
++        ``user_invocable`` e ``disable_model_invocation``. Quem alterasse o
++        corpo mantinha a assinatura válida. A versão 2 cobre tudo isso.
++        """
+         import json
+ 
+         data = {
++            "signature_version": 2,
+             "name": self.name,
+             "version": self.version,
+             "description": self.description,
+@@ -55,8 +62,12 @@
+             "required_capabilities": self.required_capabilities,
+             "tags": self.tags,
+             "depends": self.depends,
++            "metadata": self.metadata,
++            "user_invocable": self.user_invocable,
++            "disable_model_invocation": self.disable_model_invocation,
++            "markdown_content": self.markdown_content,
+         }
+-        return json.dumps(data, sort_keys=True).encode()
++        return json.dumps(data, sort_keys=True, default=str).encode("utf-8")
+ 
+ 
+ __all__ = ["SkillManifest", "SkillStep"]

@@ -1,0 +1,202 @@
+--- a/src/openjarvis/tools/file_read.py
++++ b/src/openjarvis/tools/file_read.py
+@@ -1,4 +1,16 @@
+-"""File read tool — read file contents with path validation."""
++"""Ferramenta de leitura de arquivo, restrita a diretórios permitidos.
++
++Patch N19 (e C-série): diferenças em relação ao upstream:
++
++- ``allowed_dirs`` obrigatório (ver ``_paths.py``);
++- o caminho é RESOLVIDO (symlinks seguidos) e confinado ANTES de qualquer
++  outra checagem, então a mensagem de erro não revela se um arquivo fora da
++  área existe;
++- a política de arquivos sensíveis vale para o original e o resolvido;
++- o arquivo é aberto uma vez só e lido com teto de tamanho (sem a janela entre
++  ``stat`` e a leitura, e sem delegar a leitura ao Rust);
++- ``is_local = True``: só lê dentro da área permitida.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,23 +19,21 @@
+ 
+ from openjarvis.core.registry import ToolRegistry
+ from openjarvis.core.types import ToolResult
+-from openjarvis.tools._paths import resolve_allowed_dirs
++from openjarvis.security.file_policy import is_sensitive_file
++from openjarvis.tools._paths import caminho_dentro_de, resolve_allowed_dirs
+ from openjarvis.tools._stubs import BaseTool, ToolSpec
+ 
+-# Maximum file size to read (1 MB)
+-_MAX_SIZE_BYTES = 1_048_576
++_MAX_SIZE_BYTES = 1_048_576  # 1 MB
+ 
+ 
+ @ToolRegistry.register("file_read")
+ class FileReadTool(BaseTool):
+-    """Read file contents with optional directory restrictions."""
++    """Lê o conteúdo de um arquivo dentro dos diretórios permitidos."""
+ 
+     tool_id = "file_read"
++    is_local = True
+ 
+-    def __init__(
+-        self,
+-        allowed_dirs: Optional[List[str]] = None,
+-    ) -> None:
++    def __init__(self, allowed_dirs: Optional[List[str]] = None) -> None:
+         self._allowed_dirs = [
+             Path(d).expanduser().resolve() for d in resolve_allowed_dirs(allowed_dirs)
+         ]
+@@ -32,7 +42,7 @@
+     def spec(self) -> ToolSpec:
+         return ToolSpec(
+             name="file_read",
+-            description=("Read the contents of a file. Returns the text content."),
++            description="Read the contents of a file. Returns the text content.",
+             parameters={
+                 "type": "object",
+                 "properties": {
+@@ -42,7 +52,7 @@
+                     },
+                     "max_lines": {
+                         "type": "integer",
+-                        "description": ("Max lines to return (default: all)."),
++                        "description": "Max lines to return (default: all).",
+                     },
+                 },
+                 "required": ["path"],
+@@ -50,94 +60,54 @@
+             category="filesystem",
+         )
+ 
+-    def _is_path_allowed(self, path: Path) -> bool:
+-        """Check if path is within allowed directories."""
+-        if not self._allowed_dirs:
+-            return True
+-        resolved = path.resolve()
+-        return any(
+-            resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
+-        )
++    def _negado(self, mensagem: str) -> ToolResult:
++        return ToolResult(tool_name="file_read", content=mensagem, success=False)
+ 
+     def execute(self, **params: Any) -> ToolResult:
+-        file_path = params.get("path", "")
+-        if not file_path:
+-            return ToolResult(
+-                tool_name="file_read",
+-                content="No path provided.",
+-                success=False,
+-            )
+-        path = Path(file_path)
+-        if not path.is_absolute() and self._allowed_dirs:
+-            # A relative name means "inside the sandbox", not the process cwd.
+-            path = self._allowed_dirs[0] / path
+-        # Block sensitive files (secrets, credentials, keys)
+-        from openjarvis.security.file_policy import is_sensitive_file
+-
+-        if is_sensitive_file(path):
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"Access denied: {file_path} is a sensitive file.",
+-                success=False,
+-            )
+-        if not path.exists():
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"File not found: {file_path}",
+-                success=False,
+-            )
+-        if not path.is_file():
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"Not a file: {file_path}",
+-                success=False,
+-            )
+-        if not self._is_path_allowed(path):
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"Access denied: {file_path} is outside allowed directories.",
+-                success=False,
+-            )
+-        # Check size
++        pedido = params.get("path", "")
++        if not pedido or not isinstance(pedido, str):
++            return self._negado("No path provided.")
++
++        caminho = Path(pedido).expanduser()
++        if not caminho.is_absolute():
++            # Nome relativo significa "dentro da área", não o cwd do processo.
++            caminho = self._allowed_dirs[0] / caminho
+         try:
+-            size = path.stat().st_size
+-        except OSError as exc:
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"Cannot stat file: {exc}",
+-                success=False,
+-            )
+-        if size > _MAX_SIZE_BYTES:
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"File too large: {size} bytes (max {_MAX_SIZE_BYTES}).",
+-                success=False,
+-            )
++            resolvido = caminho.resolve(strict=False)
++        except (OSError, RuntimeError):
++            return self._negado(f"Access denied: {pedido}")
++
++        # 1) confinamento — antes de qualquer outra pergunta sobre o arquivo
++        if not caminho_dentro_de(resolvido, self._allowed_dirs):
++            return self._negado(
++                f"Access denied: {pedido} is outside allowed directories."
++            )
++        # 2) política de sensíveis (original e resolvido)
++        if is_sensitive_file(caminho) or is_sensitive_file(resolvido):
++            return self._negado(f"Access denied: {pedido} is a sensitive file.")
++
++        # 3) leitura única, com teto, no caminho já resolvido
+         try:
+-            from openjarvis._rust_bridge import get_rust_module
++            with open(resolvido, "rb") as arquivo:
++                bruto = arquivo.read(_MAX_SIZE_BYTES + 1)
++        except FileNotFoundError:
++            return self._negado(f"File not found: {pedido}")
++        except IsADirectoryError:
++            return self._negado(f"Not a file: {pedido}")
++        except OSError as exc:
++            return self._negado(f"Read error: {exc.__class__.__name__}")
++        if len(bruto) > _MAX_SIZE_BYTES:
++            return self._negado(f"File too large (max {_MAX_SIZE_BYTES} bytes).")
+ 
+-            _rust = get_rust_module()
+-            text = _rust.FileReadTool().execute(str(path))
+-        except ImportError:
+-            try:
+-                text = path.read_text(encoding="utf-8")
+-            except UnicodeDecodeError:
+-                text = path.read_text(encoding="utf-8", errors="replace")
+-        except Exception as exc:
+-            return ToolResult(
+-                tool_name="file_read",
+-                content=f"Read error: {exc}",
+-                success=False,
+-            )
++        texto = bruto.decode("utf-8", errors="replace")
+         max_lines = params.get("max_lines")
+-        if max_lines is not None and max_lines > 0:
+-            lines = text.splitlines(keepends=True)
+-            text = "".join(lines[:max_lines])
++        if isinstance(max_lines, int) and max_lines > 0:
++            texto = "".join(texto.splitlines(keepends=True)[:max_lines])
+         return ToolResult(
+             tool_name="file_read",
+-            content=text,
++            content=texto,
+             success=True,
+-            metadata={"path": str(path.resolve()), "size_bytes": size},
++            metadata={"path": str(resolvido), "size_bytes": len(bruto)},
+         )
+ 
+ 

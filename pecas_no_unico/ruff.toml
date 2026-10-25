@@ -1,0 +1,9 @@
+target-version = "py310"
+src = ["src", "Tests"]
+
+[lint]
+select = ["E", "F", "I", "W"]
+
+[lint.per-file-ignores]
+# Textos de teste (strings de ataque, JSON embutido) são longos de propósito.
+"Tests/*.py" = ["E501"]

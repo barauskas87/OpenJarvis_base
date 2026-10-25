@@ -1,0 +1,451 @@
+--- a/src/openjarvis/traces/collector.py
++++ b/src/openjarvis/traces/collector.py
+@@ -1,34 +1,60 @@
+-"""TraceCollector — wraps any BaseAgent to record interaction traces."""
++"""TraceCollector — grava o rastro de cada execução de um agente.
++
++Patch N23. Diferenças em relação ao upstream:
++
++- isolamento entre execuções simultâneas: o barramento de eventos é global e
++  chama os assinantes NA thread de quem publica. O upstream guardava o estado
++  em atributos da instância e aceitava eventos de qualquer thread, então duas
++  execuções ao mesmo tempo (servidor, agendador, Telegram) misturavam passos.
++  Agora cada ``run`` cria seu próprio estado e só aceita eventos publicados
++  pela própria thread;
++- segredos são mascarados (``SecretScanner.redact``) em consulta, resposta,
++  mensagens e em todos os passos antes de gravar no SQLite;
++- a gravação do trace nunca derruba a resposta ao usuário.
++"""
+ 
+ from __future__ import annotations
+ 
++import logging
++import threading
+ import time
+ from typing import Any, Dict, List, Optional
+ 
+ from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
+ from openjarvis.core.events import EventBus, EventType
+ from openjarvis.core.types import StepType, Trace, TraceStep
++from openjarvis.security.scanner import SecretScanner
+ from openjarvis.traces.store import TraceStore
+ 
++logger = logging.getLogger(__name__)
+ 
+-class TraceCollector:
+-    """Wraps a ``BaseAgent`` and records a :class:`Trace` for every ``run()``.
+ 
+-    The collector subscribes to the ``EventBus`` to capture inference, tool,
+-    and memory events emitted during agent execution, converting them into
+-    ``TraceStep`` objects.  When the agent finishes, the complete ``Trace``
+-    is persisted to the ``TraceStore`` and published on the bus.
+-
+-    Enhanced to capture full model response content, tool call arguments and
+-    results, and the complete conversation message history.
+-
+-    Usage::
+-
+-        agent = OrchestratorAgent(engine, model, tools=tools, bus=bus)
+-        collector = TraceCollector(agent, store=trace_store, bus=bus)
+-        result = collector.run("What is 2+2?")
+-        trace = collector.last_trace  # Rich trace with steps + messages
+-    """
++def _mascarar(valor: Any, scanner: SecretScanner) -> Any:
++    """Mascara segredos em qualquer estrutura de dict/list/str."""
++    if isinstance(valor, str):
++        return scanner.redact(valor)
++    if isinstance(valor, dict):
++        return {k: _mascarar(v, scanner) for k, v in valor.items()}
++    if isinstance(valor, (list, tuple)):
++        return [_mascarar(v, scanner) for v in valor]
++    return valor
++
++
++class _Execucao:
++    """Estado de UMA execução (não compartilhado entre threads)."""
++
++    def __init__(self, thread_id: int) -> None:
++        self.thread_id = thread_id
++        self.passos: List[TraceStep] = []
++        self.modelo = ""
++        self.engine = ""
++        self.inicio_inferencia: Optional[float] = None
++        self.inicio_ferramenta: Optional[float] = None
++        self.dados_ferramenta: Dict[str, Any] = {}
++
++
++class TraceCollector:
++    """Envolve um ``BaseAgent`` e grava um ``Trace`` por ``run()``."""
+ 
+     def __init__(
+         self,
+@@ -40,10 +66,11 @@
+         self._agent = agent
+         self._store = store
+         self._bus = bus
+-        self._current_steps: list[TraceStep] = []
+-        self._current_model: str = ""
+-        self._current_engine: str = ""
+-        self._last_trace: Optional[Trace] = None
++        self._scanner = SecretScanner()
++        self._ultimo: Optional[Trace] = None
++        self._trava = threading.Lock()
++
++    # -- execução ----------------------------------------------------------
+ 
+     def run(
+         self,
+@@ -51,176 +78,169 @@
+         context: Optional[AgentContext] = None,
+         **kwargs: Any,
+     ) -> AgentResult:
+-        """Execute the wrapped agent and record a trace."""
+-        self._current_steps = []
+-        self._current_model = ""
+-        self._current_engine = ""
++        """Executa o agente e grava o trace."""
++        execucao = _Execucao(threading.get_ident())
++        desinscrever = self._inscrever(execucao)
+ 
+-        # Subscribe to events for trace collection
+-        unsubs = self._subscribe()
+-
+-        started_at = time.time()
++        inicio = time.time()
+         try:
+-            result = self._agent.run(input, context=context, **kwargs)
++            resultado = self._agent.run(input, context=context, **kwargs)
+         finally:
+-            self._unsubscribe(unsubs)
+-
+-        ended_at = time.time()
++            desinscrever()
++        fim = time.time()
+ 
+-        # Add final respond step
+-        self._current_steps.append(
++        execucao.passos.append(
+             TraceStep(
+                 step_type=StepType.RESPOND,
+-                timestamp=ended_at,
++                timestamp=fim,
+                 duration_seconds=0.0,
+-                output={"content": result.content, "turns": result.turns},
++                output={"content": resultado.content, "turns": resultado.turns},
+             )
+         )
+ 
+-        # Extract messages from agent result metadata
+-        messages: List[Dict[str, Any]] = result.metadata.get("messages", [])
+-
+-        # Build and persist the trace
+         trace = Trace(
+             query=input,
+             agent=getattr(self._agent, "agent_id", "unknown"),
+-            model=self._current_model,
+-            engine=self._current_engine,
+-            steps=list(self._current_steps),
+-            result=result.content,
+-            messages=messages,
+-            started_at=started_at,
+-            ended_at=ended_at,
++            model=execucao.modelo,
++            engine=execucao.engine,
++            steps=list(execucao.passos),
++            result=resultado.content,
++            messages=resultado.metadata.get("messages", []),
++            started_at=inicio,
++            ended_at=fim,
+         )
+-        # Recompute totals from steps
+-        for step in trace.steps:
+-            trace.total_latency_seconds += step.duration_seconds
+-            trace.total_tokens += step.output.get("tokens", 0)
+-
+-        self._last_trace = trace
++        for passo in trace.steps:
++            trace.total_latency_seconds += passo.duration_seconds
++            trace.total_tokens += passo.output.get("tokens", 0)
++
++        trace = self._mascarar_trace(trace)
++        with self._trava:
++            self._ultimo = trace
+ 
+         if self._store is not None:
+-            self._store.save(trace)
++            try:
++                self._store.save(trace)
++            except Exception:  # noqa: BLE001 — falha de gravação não afeta a resposta
++                logger.exception("Falha ao gravar o trace %s", trace.trace_id)
+ 
+         if self._bus is not None:
+             self._bus.publish(EventType.TRACE_COMPLETE, {"trace": trace})
+-
+-        return result
++        return resultado
+ 
+     @property
+     def last_trace(self) -> Optional[Trace]:
+-        """Return the trace from the most recent ``run()``."""
+-        return self._last_trace
++        with self._trava:
++            return self._ultimo
++
++    # -- mascaramento ------------------------------------------------------
++
++    def _mascarar_trace(self, trace: Trace) -> Trace:
++        trace.query = self._scanner.redact(trace.query)
++        trace.result = self._scanner.redact(trace.result)
++        trace.messages = _mascarar(trace.messages, self._scanner)
++        trace.metadata = _mascarar(trace.metadata, self._scanner)
++        for passo in trace.steps:
++            passo.input = _mascarar(passo.input, self._scanner)
++            passo.output = _mascarar(passo.output, self._scanner)
++            passo.metadata = _mascarar(passo.metadata, self._scanner)
++        return trace
+ 
+-    # -- event handlers --------------------------------------------------------
++    # -- assinantes --------------------------------------------------------
+ 
+-    def _subscribe(self) -> list[tuple]:
++    def _inscrever(self, execucao: _Execucao):
++        """Registra assinantes ligados a ESTA execução; devolve o cancelador."""
+         if self._bus is None:
+-            return []
+-        handlers = [
+-            (EventType.INFERENCE_START, self._on_inference_start),
+-            (EventType.INFERENCE_END, self._on_inference_end),
+-            (EventType.TOOL_CALL_START, self._on_tool_start),
+-            (EventType.TOOL_CALL_END, self._on_tool_end),
+-            (EventType.MEMORY_RETRIEVE, self._on_memory_retrieve),
++            return lambda: None
++
++        def so_minha_thread(tratar):
++            def envoltorio(evento: Any) -> None:
++                if threading.get_ident() == execucao.thread_id:
++                    tratar(execucao, evento)
++
++            return envoltorio
++
++        pares = [
++            (EventType.INFERENCE_START, so_minha_thread(self._ao_iniciar_inferencia)),
++            (EventType.INFERENCE_END, so_minha_thread(self._ao_fim_inferencia)),
++            (EventType.TOOL_CALL_START, so_minha_thread(self._ao_iniciar_ferramenta)),
++            (EventType.TOOL_CALL_END, so_minha_thread(self._ao_fim_ferramenta)),
++            (EventType.MEMORY_RETRIEVE, so_minha_thread(self._ao_recuperar_memoria)),
+         ]
+-        for evt_type, handler in handlers:
+-            self._bus.subscribe(evt_type, handler)
+-        return handlers
++        for tipo, tratador in pares:
++            self._bus.subscribe(tipo, tratador)
+ 
+-    def _unsubscribe(self, handlers: list[tuple]) -> None:
+-        if self._bus is None:
+-            return
+-        for evt_type, handler in handlers:
+-            self._bus.unsubscribe(evt_type, handler)
+-
+-    def _on_inference_start(self, event: Any) -> None:
+-        self._current_model = event.data.get("model", self._current_model)
+-        self._current_engine = event.data.get("engine", self._current_engine)
+-        self._inference_start_time = event.timestamp
+-
+-    def _on_inference_end(self, event: Any) -> None:
+-        start = getattr(self, "_inference_start_time", event.timestamp)
+-        data = event.data
+-        usage = data.get("usage", {})
+-        self._current_steps.append(
++        def cancelar() -> None:
++            for tipo, tratador in pares:
++                self._bus.unsubscribe(tipo, tratador)
++
++        return cancelar
++
++    @staticmethod
++    def _ao_iniciar_inferencia(exe: _Execucao, evento: Any) -> None:
++        exe.modelo = evento.data.get("model", exe.modelo)
++        exe.engine = evento.data.get("engine", exe.engine)
++        exe.inicio_inferencia = evento.timestamp
++
++    @staticmethod
++    def _ao_fim_inferencia(exe: _Execucao, evento: Any) -> None:
++        inicio = exe.inicio_inferencia or evento.timestamp
++        dados = evento.data
++        uso = dados.get("usage", {})
++        exe.passos.append(
+             TraceStep(
+                 step_type=StepType.GENERATE,
+-                timestamp=start,
+-                duration_seconds=event.timestamp - start,
+-                input={"model": self._current_model},
++                timestamp=inicio,
++                duration_seconds=evento.timestamp - inicio,
++                input={"model": exe.modelo},
+                 output={
+-                    "prompt_tokens": usage.get("prompt_tokens", 0),
+-                    "completion_tokens": usage.get("completion_tokens", 0),
+-                    "total_tokens": usage.get("total_tokens", 0),
+-                    "tokens": usage.get(
+-                        "total_tokens",
+-                        data.get("total_tokens", 0),
+-                    ),
+-                    "content": data.get("content", ""),
+-                    "tool_calls": data.get("tool_calls", []),
+-                    "tool_results": data.get("tool_results", []),
+-                    "content_blocks": data.get("content_blocks", []),
+-                    "finish_reason": data.get("finish_reason", ""),
+-                },
+-                metadata={
+-                    "engine": self._current_engine,
+-                    "ttft": data.get("ttft", 0.0),
+-                    "energy_joules": data.get("energy_joules", 0.0),
+-                    "power_watts": data.get("power_watts", 0.0),
+-                    "gpu_utilization_pct": data.get(
+-                        "gpu_utilization_pct",
+-                        0.0,
+-                    ),
+-                    "throughput_tok_per_sec": data.get(
+-                        "throughput_tok_per_sec",
+-                        0.0,
+-                    ),
++                    "prompt_tokens": uso.get("prompt_tokens", 0),
++                    "completion_tokens": uso.get("completion_tokens", 0),
++                    "total_tokens": uso.get("total_tokens", 0),
++                    "tokens": uso.get("total_tokens", dados.get("total_tokens", 0)),
++                    "content": dados.get("content", ""),
++                    "tool_calls": dados.get("tool_calls", []),
++                    "tool_results": dados.get("tool_results", []),
++                    "content_blocks": dados.get("content_blocks", []),
++                    "finish_reason": dados.get("finish_reason", ""),
+                 },
++                metadata={"engine": exe.engine},
+             )
+         )
+ 
+-    def _on_tool_start(self, event: Any) -> None:
+-        self._tool_start_time = event.timestamp
+-        self._tool_start_data = event.data
+-
+-    def _on_tool_end(self, event: Any) -> None:
+-        start = getattr(self, "_tool_start_time", event.timestamp)
+-        start_data = getattr(self, "_tool_start_data", {})
+-        # Pull through any metadata the tool attached to its ToolResult
+-        # (e.g. SkillTool's skill/skill_source/skill_kind tags) so the
+-        # SkillOptimizer can bucket traces by skill name.
+-        result_metadata = event.data.get("metadata") or {}
+-        self._current_steps.append(
++    @staticmethod
++    def _ao_iniciar_ferramenta(exe: _Execucao, evento: Any) -> None:
++        exe.inicio_ferramenta = evento.timestamp
++        exe.dados_ferramenta = evento.data
++
++    @staticmethod
++    def _ao_fim_ferramenta(exe: _Execucao, evento: Any) -> None:
++        inicio = exe.inicio_ferramenta or evento.timestamp
++        exe.passos.append(
+             TraceStep(
+                 step_type=StepType.TOOL_CALL,
+-                timestamp=start,
+-                duration_seconds=event.data.get(
+-                    "latency",
+-                    event.timestamp - start,
+-                ),
++                timestamp=inicio,
++                duration_seconds=evento.data.get("latency", evento.timestamp - inicio),
+                 input={
+-                    "tool": event.data.get("tool", ""),
+-                    "arguments": start_data.get("arguments", {}),
++                    "tool": evento.data.get("tool", ""),
++                    "arguments": exe.dados_ferramenta.get("arguments", {}),
+                 },
+                 output={
+-                    "success": event.data.get("success", False),
+-                    "result": event.data.get("result", ""),
++                    "success": evento.data.get("success", False),
++                    "result": evento.data.get("result", ""),
+                 },
+-                metadata=dict(result_metadata),
++                metadata=dict(evento.data.get("metadata") or {}),
+             )
+         )
+ 
+-    def _on_memory_retrieve(self, event: Any) -> None:
+-        self._current_steps.append(
++    @staticmethod
++    def _ao_recuperar_memoria(exe: _Execucao, evento: Any) -> None:
++        exe.passos.append(
+             TraceStep(
+                 step_type=StepType.RETRIEVE,
+-                timestamp=event.timestamp,
+-                duration_seconds=event.data.get("latency", 0.0),
+-                input={"query": event.data.get("query", "")},
+-                output={
+-                    "num_results": event.data.get("num_results", 0),
+-                },
++                timestamp=evento.timestamp,
++                duration_seconds=evento.data.get("latency", 0.0),
++                input={"query": evento.data.get("query", "")},
++                output={"num_results": evento.data.get("num_results", 0)},
+             )
+         )
+ 
+@@ -236,47 +256,35 @@
+     started_at: float,
+     ended_at: float,
+ ) -> Optional[Trace]:
+-    """Persist a minimal single-step ``Trace`` for a non-agent response.
+-
+-    The streaming SSE and WebSocket chat paths stream straight from the
+-    engine, bypassing the agent (and therefore ``TraceCollector``). They call
+-    this so those interactions still land in ``traces.db`` — otherwise streamed
+-    chats, which are the desktop GUI's main path, would never produce traces.
+-
+-    Best-effort: returns the saved ``Trace`` or ``None`` (when *store* is
+-    ``None`` or persistence raised), and never propagates an exception into the
+-    caller's response path.
+-    """
++    """Grava um trace mínimo (de uma etapa) para respostas fora de agente."""
+     if store is None:
+         return None
+     try:
+-        duration = max(0.0, ended_at - started_at)
++        scanner = SecretScanner()
++        duracao = max(0.0, ended_at - started_at)
++        resultado = scanner.redact(result)
+         trace = Trace(
+-            query=query,
++            query=scanner.redact(query),
+             agent=agent,
+             model=model,
+             engine=engine,
+-            result=result,
++            result=resultado,
+             started_at=started_at,
+             ended_at=ended_at,
+             steps=[
+                 TraceStep(
+                     step_type=StepType.RESPOND,
+                     timestamp=ended_at,
+-                    duration_seconds=duration,
+-                    output={"content": result},
++                    duration_seconds=duracao,
++                    output={"content": resultado},
+                 )
+             ],
+         )
+-        trace.total_latency_seconds = duration
++        trace.total_latency_seconds = duracao
+         store.save(trace)
+         return trace
+-    except Exception:
+-        import logging
+-
+-        logging.getLogger("openjarvis.traces").debug(
+-            "record_response_trace failed", exc_info=True
+-        )
++    except Exception:  # noqa: BLE001
++        logger.debug("record_response_trace failed", exc_info=True)
+         return None
+ 
+ 

@@ -1,0 +1,52 @@
+--- a/src/openjarvis/security/boundary.py
++++ b/src/openjarvis/security/boundary.py
+@@ -21,7 +21,11 @@
+ 
+ 
+ class SecurityBlockError(Exception):
+-    """Raised when mode='block' and secrets/PII are detected."""
++    """Levantada no modo 'block' quando há segredo/PII.
++
++    Patch N17: o upstream tinha duas classes com esse nome (aqui e em
++    guardrails.py); ``except`` de uma não pegava a outra. Esta é a única.
++    """
+ 
+ 
+ class BoundaryGuard:
+@@ -58,18 +62,14 @@
+ 
+     @staticmethod
+     def _default_scanners() -> List["BaseScanner"]:
+-        try:
+-            from openjarvis.security.scanner import PIIScanner, SecretScanner
++        """Scanners padrão. Falha ALTO se não carregarem (nada de no-op silencioso).
+ 
+-            return [SecretScanner(), PIIScanner()]
+-        except (ImportError, Exception) as exc:
+-            logger.warning(
+-                "Rust-backed scanners unavailable (%s); "
+-                "BoundaryGuard running without scanners. "
+-                "Build the Rust extension: uv run maturin develop",
+-                exc,
+-            )
+-            return []
++        Patch N16: o upstream devolvia lista vazia quando o Rust faltava e o
++        guarda passava tudo, só com um aviso no log.
++        """
++        from openjarvis.security.scanner import PIIScanner, SecretScanner
++
++        return [SecretScanner(), PIIScanner()]
+ 
+     def scan_outbound(self, content: str, destination: str) -> str:
+         """Scan text before it leaves the device.
+@@ -132,7 +132,9 @@
+                     "source": "boundary_guard",
+                     "destination": destination,
+                     "mode": self._mode,
+-                    "content_preview": content[:80],
++                    # Patch: sem prévia do conteúdo — ela vazava o segredo
++                    # que o guarda acabara de detectar.
++                    "content_chars": len(content),
+                 },
+             )
+         except Exception:

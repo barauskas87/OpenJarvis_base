@@ -1,0 +1,63 @@
+--- a/src/openjarvis/security/signing.py
++++ b/src/openjarvis/security/signing.py
+@@ -64,17 +64,19 @@
+ def verify(data: bytes, signature: bytes, public_key: bytes) -> bool:
+     """Verify an Ed25519 *signature* on *data* with *public_key*.
+ 
+-    Returns True if valid, False otherwise.
++    Returns True if valid, False otherwise (inclusive entrada malformada).
+     """
++    if not signature or not public_key:
++        return False
+     try:
+         from cryptography.exceptions import InvalidSignature
+         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+ 
+-        key = Ed25519PublicKey.from_public_bytes(public_key)
+         try:
++            key = Ed25519PublicKey.from_public_bytes(public_key)
+             key.verify(signature, data)
+             return True
+-        except InvalidSignature:
++        except (InvalidSignature, ValueError):
+             return False
+     except ImportError as exc:
+         raise ImportError(
+@@ -112,11 +114,35 @@
+     return raw
+ 
+ 
++def _gravar_privado(caminho: str, conteudo: str) -> None:
++    """Grava arquivo com permissão 0600 desde a criação (sem janela aberta)."""
++    import os
++
++    descritor = os.open(caminho, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    try:
++        with os.fdopen(descritor, "w", encoding="utf-8") as arquivo:
++            arquivo.write(conteudo)
++    except Exception:
++        try:
++            os.close(descritor)
++        except OSError:
++            pass
++        raise
++    try:
++        os.chmod(caminho, 0o600)  # corrige arquivo pré-existente com permissão aberta
++    except OSError:
++        pass
++
++
+ def save_keypair(keypair: KeyPair, private_path: str, public_path: str) -> None:
+-    """Save keypair to files (base64-encoded)."""
++    """Salva o par de chaves (base64). A chave privada fica com permissão 0600.
++
++    Patch N25: o upstream usava ``write_text`` (permissão padrão do sistema,
++    por exemplo 0644) para a chave privada.
++    """
+     from pathlib import Path
+ 
+-    Path(private_path).write_text(base64.b64encode(keypair.private_key).decode())
++    _gravar_privado(private_path, base64.b64encode(keypair.private_key).decode())
+     Path(public_path).write_text(base64.b64encode(keypair.public_key).decode())
+ 
+ 

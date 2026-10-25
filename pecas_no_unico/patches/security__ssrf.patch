@@ -1,0 +1,45 @@
+--- a/src/openjarvis/security/ssrf.py
++++ b/src/openjarvis/security/ssrf.py
+@@ -23,6 +23,9 @@
+     ipaddress.ip_network("192.168.0.0/16"),
+     ipaddress.ip_network("127.0.0.0/8"),
+     ipaddress.ip_network("169.254.0.0/16"),  # link-local
++    ipaddress.ip_network("100.64.0.0/10"),  # CGNAT (RFC 6598)
++    ipaddress.ip_network("198.18.0.0/15"),  # benchmark (RFC 2544)
++    ipaddress.ip_network("192.0.0.0/24"),  # IETF protocol assignments
+     ipaddress.ip_network("224.0.0.0/4"),  # multicast
+     ipaddress.ip_network("255.255.255.255/32"),  # broadcast
+     ipaddress.ip_network("::/128"),  # IPv6 unspecified
+@@ -70,17 +73,14 @@
+ 
+ 
+ def check_ssrf(url: str) -> Optional[str]:
+-    """Check a URL for SSRF vulnerabilities.
++    """Verifica uma URL contra SSRF. Devolve o motivo do bloqueio ou ``None``.
+ 
+-    Prefers the Rust backend, but falls back to the pure-Python
+-    implementation when the compiled extension is unavailable. The SSRF
+-    guard is security-critical, so it must never be silently skipped — or
+-    crash with ``ImportError`` — merely because Rust was not built.
++    Patch: o upstream preferia o Rust quando disponível. Aqui só existe a
++    versão Python, para o comportamento ser o mesmo em qualquer instalação.
++    Limite conhecido: o DNS é resolvido aqui e o cliente HTTP resolve de novo
++    (janela de DNS rebinding). Para reduzir, ``http_request`` revalida a cada
++    redirecionamento; para eliminar, seria preciso fixar o IP na conexão.
+     """
+-    from openjarvis._rust_bridge import RUST_AVAILABLE, get_rust_module
+-
+-    if RUST_AVAILABLE:
+-        return get_rust_module().check_ssrf(url)
+     return _check_ssrf_python(url)
+ 
+ 
+@@ -90,6 +90,8 @@
+     from urllib.parse import urlparse
+ 
+     parsed = urlparse(url)
++    if parsed.scheme not in ("http", "https"):
++        return f"Blocked scheme: {parsed.scheme or '(none)'}"
+     hostname = parsed.hostname
+     if not hostname:
+         return "No hostname in URL"
