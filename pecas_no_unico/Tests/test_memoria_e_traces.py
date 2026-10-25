@@ -77,6 +77,62 @@ class TestStoreDeFatos:
         [t.join() for t in ts]
         assert LocalFactStore(arq, max_facts=1000).count() == 60
 
+    @pytest.mark.interferencia
+    def test_escrita_concorrente_repetida_com_arquivos_novos(self, tmp_path):
+        """A corrida do arquivo de lock só aparece na criação: repete com arquivos novos."""
+        for rodada in range(25):
+            arq = tmp_path / f"r{rodada}.jsonl"
+            lojas = [LocalFactStore(arq, max_facts=1000) for _ in range(4)]
+            erros = []
+
+            def trabalho(i, lojas=lojas, erros=erros):
+                try:
+                    for n in range(3):
+                        lojas[i].add(f"fato-{i}-{n}")
+                except Exception as exc:  # noqa: BLE001
+                    erros.append(exc)
+
+            ts = [threading.Thread(target=trabalho, args=(i,)) for i in range(4)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            assert not erros, erros
+            assert LocalFactStore(arq, max_facts=1000).count() == 12
+
+    def test_byte_do_lock_tolera_regiao_ja_travada(self):
+        """Simula o Windows: a escrita do byte inicial falha porque outro já travou."""
+        from openjarvis.memory.store import _garantir_byte_do_lock
+
+        class ArquivoTravado:
+            def seek(self, *a):
+                return 0
+
+            def tell(self):
+                return 0
+
+            def write(self, dados):
+                raise PermissionError(13, "Permission denied")
+
+        _garantir_byte_do_lock(ArquivoTravado())  # não pode levantar
+
+    def test_byte_do_lock_nao_esconde_outros_erros(self):
+        from openjarvis.memory.store import _garantir_byte_do_lock
+
+        class ArquivoSemLeitura:
+            def seek(self, *a):
+                raise ValueError("arquivo fechado")
+
+        with pytest.raises(ValueError):
+            _garantir_byte_do_lock(ArquivoSemLeitura())
+
+    def test_byte_do_lock_escreve_um_byte_no_arquivo_vazio(self, tmp_path):
+        from openjarvis.memory.store import _garantir_byte_do_lock
+
+        alvo = tmp_path / "l.lock"
+        with open(alvo, "a+b", buffering=0) as f:
+            _garantir_byte_do_lock(f)
+            _garantir_byte_do_lock(f)  # segunda vez não acrescenta
+        assert alvo.read_bytes() == b"\0"
+
 
 # --------------------------------------------------------------------------
 # Serviço de memória (N21)

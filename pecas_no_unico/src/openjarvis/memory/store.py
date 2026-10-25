@@ -90,6 +90,22 @@ RECALLABLE_TRUST_TIERS = frozenset({"", TRUST_AUTO, TRUST_TRUSTED})
 _RECALLABLE_TIERS = RECALLABLE_TRUST_TIERS  # internal alias
 
 
+def _garantir_byte_do_lock(f) -> None:
+    """Garante que o arquivo de lock tenha ao menos 1 byte (necessário no Windows).
+
+    Patch: no Windows o bloqueio de bytes é obrigatório. Se duas instâncias criam
+    o arquivo ao mesmo tempo, uma delas já escreveu o byte e travou a região, e a
+    escrita da outra dá ``PermissionError``. Nesse caso o byte já existe, então o
+    erro é ignorado (o upstream deixava a exceção subir e o fato era perdido).
+    """
+    f.seek(0, os.SEEK_END)
+    if f.tell() == 0:
+        try:
+            f.write(b"\0")
+        except OSError:
+            pass  # outro já criou o byte e está com a região travada
+
+
 @contextmanager
 def _cross_process_lock(lock_path: Path) -> Iterator[None]:
     """Hold an exclusive, blocking OS-level lock on *lock_path*.
@@ -101,15 +117,14 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
     failing fast, since callers want to wait their turn, not error out.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(lock_path, "a+b")
+    # Patch (Windows): sem buffer, para que a escrita do byte inicial falhe (ou
+    # não) na hora, sem deixar resíduo no buffer que estouraria em ``close()``.
+    f = open(lock_path, "a+b", buffering=0)
     try:
         if sys.platform == "win32":
             # msvcrt locks a byte range; the file needs at least one byte
             # for the region at offset 0 to be lockable.
-            f.seek(0, os.SEEK_END)
-            if f.tell() == 0:
-                f.write(b"\0")
-                f.flush()
+            _garantir_byte_do_lock(f)
             _lock_windows_blocking(f)
         else:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
