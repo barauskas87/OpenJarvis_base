@@ -1,0 +1,249 @@
+--- a/src/openjarvis/channels/telegram.py
++++ b/src/openjarvis/channels/telegram.py
+@@ -3,11 +3,12 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import concurrent.futures
+ import logging
+ import os
+ import textwrap
+ import threading
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, Iterable, List, Optional, Union
+ 
+ from openjarvis.channels._stubs import (
+     BaseChannel,
+@@ -43,12 +44,22 @@
+         self,
+         bot_token: str = "",
+         *,
+-        allowed_chat_ids: str = "",
++        allowed_user_ids: Union[str, Iterable[Union[str, int]]] = "",
++        allowed_chat_ids: Union[str, Iterable[Union[str, int]]] = "",
+         parse_mode: str = "Markdown",
+         bus: Optional[EventBus] = None,
++        descartar_pendentes: bool = True,
++        max_workers: int = 4,
+     ) -> None:
++        # Patch N22: a lista de USUÁRIOS permitidos é obrigatória. No upstream a
++        # lista era opcional (vazia = qualquer pessoa fala com o agente) e só
++        # comparava o id do CHAT (qualquer membro de um grupo permitido passava).
+         self._token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+-        self._allowed_chat_ids = allowed_chat_ids
++        self._allowed_user_ids = self._parse_ids(allowed_user_ids)
++        self._allowed_chat_ids = self._parse_ids(allowed_chat_ids)
++        self._descartar_pendentes = descartar_pendentes
++        self._max_workers = max(1, int(max_workers))
++        self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+         self._parse_mode = parse_mode
+         self._bus = bus
+         self._handlers: List[ChannelHandler] = []
+@@ -67,6 +78,30 @@
+         self._async_stop_event: Optional[asyncio.Event] = None
+         self._runtime_lock = threading.Lock()
+ 
++    # -- autorização e utilidades -----------------------------------------------
++
++    @staticmethod
++    def _parse_ids(valor: Union[str, Iterable[Union[str, int]]]) -> frozenset:
++        """Aceita "1,2,3" ou uma lista de ids; devolve um conjunto de textos."""
++        if isinstance(valor, str):
++            partes = valor.split(",")
++        else:
++            partes = list(valor or [])
++        return frozenset(str(p).strip() for p in partes if str(p).strip())
++
++    def autorizado(self, user_id: str, chat_id: str) -> bool:
++        """True se o USUÁRIO está na lista (e o chat, se houver lista de chats)."""
++        if not user_id or user_id not in self._allowed_user_ids:
++            return False
++        if self._allowed_chat_ids and chat_id not in self._allowed_chat_ids:
++            return False
++        return True
++
++    def _sem_token(self, texto: object) -> str:
++        """Remove o token de qualquer texto que vá para log."""
++        saida = str(texto)
++        return saida.replace(self._token, "[token]") if self._token else saida
++
+     # -- connection lifecycle ---------------------------------------------------
+ 
+     def connect(self) -> None:
+@@ -85,9 +120,19 @@
+                 logger.warning("No Telegram bot token configured")
+                 self._status = ChannelStatus.ERROR
+                 return
++            if not self._allowed_user_ids:
++                logger.error(
++                    "Telegram: allowed_user_ids vazio. Recusando conectar: sem "
++                    "lista de usuários permitidos qualquer pessoa falaria com o agente."
++                )
++                self._status = ChannelStatus.ERROR
++                return
+ 
+             self._stop_event.clear()
+             self._status = ChannelStatus.CONNECTING
++            self._pool = concurrent.futures.ThreadPoolExecutor(
++                max_workers=self._max_workers, thread_name_prefix="telegram-handler"
++            )
+ 
+             try:
+                 from telegram.ext import ApplicationBuilder  # noqa: F401
+@@ -145,6 +190,9 @@
+                     return
+                 self._listener_thread = None
+ 
++            if self._pool is not None:
++                self._pool.shutdown(wait=False, cancel_futures=True)
++                self._pool = None
+             self._status = ChannelStatus.DISCONNECTED
+ 
+     # -- send / receive --------------------------------------------------------
+@@ -209,7 +257,7 @@
+                         logger.warning(
+                             "Telegram rejected Markdown formatting, "
+                             "retrying as plain text: %s",
+-                            resp.text,
++                            self._sem_token(resp.text),
+                         )
+                         plain_payload = {
+                             k: v for k, v in payload.items() if k != "parse_mode"
+@@ -219,13 +267,14 @@
+                         logger.warning(
+                             "Telegram API returned status %d: %s",
+                             resp.status_code,
+-                            resp.text,
++                            self._sem_token(resp.text),
+                         )
+                         return False
+             self._publish_sent(channel, content, conversation_id)
+             return True
+-        except Exception:
+-            logger.debug("Telegram send failed", exc_info=True)
++        except Exception as exc:  # noqa: BLE001
++            # Sem exc_info: o traceback do httpx pode carregar a URL com o token.
++            logger.debug("Telegram send failed: %s", self._sem_token(exc))
+             return False
+ 
+     def status(self) -> ChannelStatus:
+@@ -342,7 +391,7 @@
+                     return
+ 
+             if not await self._run_stage_until_stopped(
+-                updater.start_polling(drop_pending_updates=True),
++                updater.start_polling(drop_pending_updates=self._descartar_pendentes),
+                 async_stop_event,
+             ):
+                 return
+@@ -384,49 +433,12 @@
+                 self._app = app
+ 
+             async def _handle_msg(update, context):
+-                msg = update.message
+-                if msg is None:
+-                    return
+-                cm = ChannelMessage(
+-                    channel="telegram",
+-                    sender=str(msg.from_user.id) if msg.from_user else "",
+-                    content=msg.text or "",
+-                    message_id=str(msg.message_id),
+-                    conversation_id=str(msg.chat.id),
+-                )
+-                # Enforce allow-list when configured
+-                if self._allowed_chat_ids:
+-                    _allowed = {
+-                        cid.strip()
+-                        for cid in self._allowed_chat_ids.split(",")
+-                        if cid.strip()
+-                    }
+-                    if cm.conversation_id not in _allowed:
+-                        logger.debug(
+-                            "Ignoring message from unlisted chat %s",
+-                            cm.conversation_id,
+-                        )
+-                        return
+-                for handler in self._handlers:
+-                    try:
+-                        handler(cm)
+-                    except Exception:
+-                        logger.exception("Telegram handler error")
+-                if self._bus is not None:
+-                    self._bus.publish(
+-                        EventType.CHANNEL_MESSAGE_RECEIVED,
+-                        {
+-                            "channel": cm.channel,
+-                            "sender": cm.sender,
+-                            "content": cm.content,
+-                            "message_id": cm.message_id,
+-                        },
+-                    )
++                await self._tratar_update(update)
+ 
+             app.add_handler(MessageHandler(filters.TEXT, _handle_msg))
+             loop.run_until_complete(self._run_polling_lifecycle(app, async_stop_event))
+-        except Exception:
+-            logger.debug("Telegram poll loop error", exc_info=True)
++        except Exception as exc:  # noqa: BLE001
++            logger.debug("Telegram poll loop error: %s", self._sem_token(exc))
+             if not self._stop_event.is_set():
+                 self._status = ChannelStatus.ERROR
+         finally:
+@@ -440,6 +452,57 @@
+             if self._stop_event.is_set():
+                 self._status = ChannelStatus.DISCONNECTED
+ 
++    async def _tratar_update(self, update: Any) -> None:
++        """Autoriza e despacha uma mensagem recebida (fora do loop do PTB).
++
++        Patch N22: o handler do agente (chamada de modelo, possivelmente minutos)
++        roda num ``ThreadPoolExecutor``; no upstream rodava dentro do loop do
++        PTB e travava o bot inteiro. O retorno do handler, se for texto, é
++        enviado como resposta (no upstream era ignorado).
++        """
++        msg = getattr(update, "message", None)
++        if msg is None:
++            return
++        user_id = str(msg.from_user.id) if getattr(msg, "from_user", None) else ""
++        chat_id = str(msg.chat.id)
++        if not self.autorizado(user_id, chat_id):
++            # Não registra o conteúdo nem o nome: só que houve tentativa.
++            logger.debug("Telegram: mensagem de usuário não autorizado ignorada")
++            return
++        cm = ChannelMessage(
++            channel="telegram",
++            sender=user_id,
++            content=msg.text or "",
++            message_id=str(msg.message_id),
++            conversation_id=chat_id,
++        )
++        pool = self._pool
++        if pool is None:
++            return
++        loop = asyncio.get_running_loop()
++        await loop.run_in_executor(pool, self._despachar, cm)
++
++    def _despachar(self, cm: ChannelMessage) -> None:
++        """Entrega a mensagem aos handlers e responde com o texto devolvido."""
++        for handler in list(self._handlers):
++            try:
++                resposta = handler(cm)
++            except Exception:  # noqa: BLE001
++                logger.exception("Telegram handler error")
++                continue
++            if isinstance(resposta, str) and resposta.strip():
++                self.send(cm.conversation_id, resposta, conversation_id=cm.message_id)
++        if self._bus is not None:
++            self._bus.publish(
++                EventType.CHANNEL_MESSAGE_RECEIVED,
++                {
++                    "channel": cm.channel,
++                    "sender": cm.sender,
++                    "content": cm.content,
++                    "message_id": cm.message_id,
++                },
++            )
++
+     def _publish_sent(self, channel: str, content: str, conversation_id: str) -> None:
+         """Publish a CHANNEL_MESSAGE_SENT event on the bus."""
+         if self._bus is not None:

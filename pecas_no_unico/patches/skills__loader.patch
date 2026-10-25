@@ -1,0 +1,547 @@
+--- a/src/openjarvis/skills/loader.py
++++ b/src/openjarvis/skills/loader.py
+@@ -1,322 +1,288 @@
+-"""Skill loader — load and verify skill manifests from TOML files."""
++"""Carregador de skills (TOML e SKILL.md) com verificação que falha FECHADA.
++
++Patches N1 e N5. Diferenças em relação ao upstream:
++
++- N1: ``verify_signature=True`` agora EXIGE chave pública e assinatura. No
++  upstream (``if verify_signature and public_key and manifest.signature``) uma
++  skill sem assinatura, ou uma chamada sem chave, passava sem nenhum erro;
++- N1: a assinatura cobre também o corpo do SKILL.md e os metadados
++  (ver ``SkillManifest.manifest_bytes``), e é verificada DEPOIS de juntar
++  TOML + SKILL.md;
++- N1: ``discover_skills`` aceita os mesmos parâmetros de verificação (o
++  upstream nunca verificava no caminho de descoberta);
++- N1: ``scan_for_injection`` usa o ``InjectionScanner`` sobre descrição, passos
++  e corpo (o upstream usava o detector de SEGREDOS e ignorava o corpo);
++- sem o "fallback legado" que aceitava nome inválido quando a validação estrita
++  falhava; o nome vira nome de ferramenta e de diretório;
++- N5: ``pyyaml`` é dependência declarada (ver requirements.txt).
++"""
+ 
+ from __future__ import annotations
+ 
++import logging
++import re
+ from pathlib import Path
+ from typing import Optional
+ 
+ import yaml
+ 
++from openjarvis.security.injection_scanner import InjectionScanner
++from openjarvis.security.signing import verify_b64
++from openjarvis.security.types import ThreatLevel
+ from openjarvis.skills.types import SkillManifest, SkillStep
+ 
+ try:
+     import tomllib
+-except ModuleNotFoundError:
++except ModuleNotFoundError:  # Python 3.10
+     import tomli as tomllib  # type: ignore[no-redef]
+ 
+-import logging
+-
+ LOGGER = logging.getLogger(__name__)
+ 
++# Nome seguro para virar nome de ferramenta/diretório (sem separadores de caminho).
++_NOME_SEGURO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+ 
+-def _read_source_metadata(path: Path) -> dict:
+-    """Read .source TOML file if present, returning the parsed dict.
+ 
+-    Returns an empty dict if the file is missing or malformed.  Never
+-    raises — bad sidecar files should never break skill loading.  Logs
+-    a warning when a malformed file is encountered so users can debug
+-    why their imported source provenance is missing.
+-    """
+-    source_path = path / ".source"
+-    if not source_path.exists():
+-        return {}
+-    try:
+-        with open(source_path, "rb") as fh:
+-            return tomllib.load(fh)
+-    except Exception as exc:
+-        LOGGER.warning(
+-            "Malformed .source sidecar at %s (skill source provenance "
+-            "will be missing): %s",
+-            source_path,
+-            exc,
+-        )
+-        return {}
++class SkillSignatureError(ValueError):
++    """Assinatura ausente, inválida ou impossível de verificar."""
+ 
+ 
+-def load_skill(
+-    path: str | Path,
+-    *,
+-    verify_signature: bool = False,
+-    public_key: Optional[bytes] = None,
+-    scan_for_injection: bool = False,
+-) -> SkillManifest:
+-    """Load a skill manifest from a TOML file.
++class SkillInjectionError(ValueError):
++    """O scanner encontrou padrão de injeção grave na skill."""
+ 
+-    Expected format:
+-    ```toml
+-    [skill]
+-    name = "research_and_summarize"
+-    version = "0.1.0"
+-    description = "Search web and summarize results"
+-    author = "openjarvis"
+-    required_capabilities = ["network:fetch"]
+-    signature = ""
+-
+-    [[skill.steps]]
+-    tool_name = "web_search"
+-    arguments_template = '{"query": "{query}"}'
+-    output_key = "search_results"
+-
+-    [[skill.steps]]
+-    tool_name = "think"
+-    arguments_template = '{"thought": "Summarize: {search_results}"}'
+-    output_key = "summary"
+-    ```
+-    """
+-    path = Path(path)
++
++def _validar_nome(nome: str) -> str:
++    if not isinstance(nome, str) or not _NOME_SEGURO.match(nome):
++        raise ValueError(f"Nome de skill inválido: {nome!r}")
++    return nome
++
++
++def _ler_toml(path: Path) -> SkillManifest:
++    """Lê um skill.toml, SEM verificar assinatura (a verificação é depois)."""
+     with open(path, "rb") as fh:
+         data = tomllib.load(fh)
++    skill = data.get("skill", {})
+ 
+-    skill_data = data.get("skill", {})
+-
+-    steps = []
+-    for step_data in skill_data.get("steps", []):
+-        steps.append(
+-            SkillStep(
+-                tool_name=step_data.get("tool_name", ""),
+-                skill_name=step_data.get("skill_name", ""),
+-                arguments_template=step_data.get("arguments_template", "{}"),
+-                output_key=step_data.get("output_key", ""),
+-            )
++    passos = [
++        SkillStep(
++            tool_name=p.get("tool_name", ""),
++            skill_name=p.get("skill_name", ""),
++            arguments_template=p.get("arguments_template", "{}"),
++            output_key=p.get("output_key", ""),
+         )
++        for p in skill.get("steps", [])
++    ]
++    return SkillManifest(
++        name=_validar_nome(skill.get("name", path.stem)),
++        version=skill.get("version", "0.1.0"),
++        description=skill.get("description", ""),
++        author=skill.get("author", ""),
++        steps=passos,
++        required_capabilities=list(skill.get("required_capabilities", [])),
++        signature=skill.get("signature", ""),
++        metadata=skill.get("metadata", {}),
++        tags=list(skill.get("tags", [])),
++        depends=list(skill.get("depends", [])),
++        user_invocable=skill.get("user_invocable", True),
++        disable_model_invocation=skill.get("disable_model_invocation", False),
++    )
++
++
++def _ler_markdown(path: Path) -> SkillManifest:
++    """Lê um SKILL.md (frontmatter YAML + corpo) com validação estrita."""
++    from openjarvis.skills.parser import SkillParser
++
++    bruto = path.read_text(encoding="utf-8")
++    frontmatter: dict = {}
++    corpo = bruto
++
++    if bruto.startswith("---"):
++        resto = bruto[3:]
++        if resto.startswith("\n"):
++            resto = resto[1:]
++        fim = resto.find("\n---")
++        if fim != -1:
++            try:
++                carregado = yaml.safe_load(resto[:fim]) or {}
++            except yaml.YAMLError as exc:
++                raise ValueError(f"Frontmatter YAML inválido em {path}") from exc
++            if not isinstance(carregado, dict):
++                raise ValueError(f"Frontmatter de {path} deve ser um mapa")
++            frontmatter = carregado
++            depois = resto[fim + 4 :]
++            corpo = depois[1:] if depois.startswith("\n") else depois
+ 
+-    manifest = SkillManifest(
+-        name=skill_data.get("name", path.stem),
+-        version=skill_data.get("version", "0.1.0"),
+-        description=skill_data.get("description", ""),
+-        author=skill_data.get("author", ""),
+-        steps=steps,
+-        required_capabilities=skill_data.get("required_capabilities", []),
+-        signature=skill_data.get("signature", ""),
+-        metadata=skill_data.get("metadata", {}),
+-        tags=skill_data.get("tags", []),
+-        depends=skill_data.get("depends", []),
+-        user_invocable=skill_data.get("user_invocable", True),
+-        disable_model_invocation=skill_data.get("disable_model_invocation", False),
++    frontmatter.setdefault(
++        "name", path.parent.name if path.name == "SKILL.md" else path.stem
+     )
++    frontmatter.setdefault("description", str(frontmatter["name"]))
++    # A assinatura não faz parte do que é assinado: sai do frontmatter.
++    assinatura = str(frontmatter.pop("signature", "") or "")
+ 
+-    # Verify signature if requested
+-    if verify_signature and public_key and manifest.signature:
+-        try:
+-            from openjarvis.security.signing import verify_b64
++    manifesto = SkillParser().parse_frontmatter(frontmatter, markdown_content=corpo)
++    manifesto.signature = assinatura
++    return manifesto
+ 
+-            valid = verify_b64(
+-                manifest.manifest_bytes(),
+-                manifest.signature,
+-                public_key,
+-            )
+-            if not valid:
+-                raise ValueError(f"Invalid signature for skill '{manifest.name}'")
+-        except ImportError:
+-            raise ImportError(
+-                "Signature verification requires 'cryptography'. "
+-                "Install with: uv sync --extra security-signing"
++
++def _verificar(
++    manifesto: SkillManifest,
++    *,
++    verify_signature: bool,
++    public_key: Optional[bytes],
++    scan_for_injection: bool,
++) -> SkillManifest:
++    """Aplica as verificações pedidas. Qualquer falha LEVANTA exceção."""
++    if verify_signature:
++        if not public_key:
++            raise SkillSignatureError(
++                f"Skill '{manifesto.name}': chave pública não informada"
+             )
++        if not manifesto.signature:
++            raise SkillSignatureError(f"Skill '{manifesto.name}': sem assinatura")
++        if not verify_b64(manifesto.manifest_bytes(), manifesto.signature, public_key):
++            raise SkillSignatureError(f"Skill '{manifesto.name}': assinatura inválida")
+ 
+-    # Scan for prompt injection if requested
+     if scan_for_injection:
+-        try:
+-            from openjarvis.security.scanner import SecretScanner
++        scanner = InjectionScanner()
++        textos = [manifesto.description, manifesto.markdown_content]
++        textos += [p.arguments_template for p in manifesto.steps]
++        for texto in textos:
++            resultado = scanner.scan(texto or "")
++            if not resultado.is_clean and resultado.threat_level in (
++                ThreatLevel.HIGH,
++                ThreatLevel.CRITICAL,
++            ):
++                primeiro = resultado.findings[0]
++                raise SkillInjectionError(
++                    f"Skill '{manifesto.name}': possível injeção de prompt "
++                    f"({primeiro.pattern_name})"
++                )
++    return manifesto
+ 
+-            scanner = SecretScanner()
+-            for step in manifest.steps:
+-                scan_result = scanner.scan(step.arguments_template)
+-                if scan_result.findings:
+-                    raise ValueError(
+-                        f"Potential prompt injection in skill '{manifest.name}', "
+-                        f"step '{step.tool_name}': "
+-                        f"{scan_result.findings[0].description}"
+-                    )
+-        except ImportError:
+-            pass
+-
+-    return manifest
+-
+-
+-def load_skill_markdown(path: str | Path) -> SkillManifest:
+-    """Load a skill manifest from a SKILL.md file via SkillParser.
+-
+-    Parses YAML frontmatter (between ``---`` delimiters) and the markdown
+-    body, then runs them through :class:`SkillParser` for strict validation
+-    and tolerant field mapping.
+-    """
+-    from openjarvis.skills.parser import SkillParseError, SkillParser
+ 
+-    path = Path(path)
+-    raw = path.read_text(encoding="utf-8")
++def load_skill(
++    path: str | Path,
++    *,
++    verify_signature: bool = False,
++    public_key: Optional[bytes] = None,
++    scan_for_injection: bool = False,
++) -> SkillManifest:
++    """Carrega uma skill de um arquivo TOML (``[skill]`` e ``[[skill.steps]]``)."""
++    manifesto = _ler_toml(Path(path))
++    return _verificar(
++        manifesto,
++        verify_signature=verify_signature,
++        public_key=public_key,
++        scan_for_injection=scan_for_injection,
++    )
+ 
+-    frontmatter: dict = {}
+-    markdown_content = raw
+ 
+-    if raw.startswith("---"):
+-        rest = raw[3:]
+-        if rest.startswith("\n"):
+-            rest = rest[1:]
+-        end_idx = rest.find("\n---")
+-        if end_idx != -1:
+-            yaml_block = rest[:end_idx]
+-            try:
+-                frontmatter = yaml.safe_load(yaml_block) or {}
+-            except yaml.YAMLError:
+-                frontmatter = {}
+-            after = rest[end_idx + 4 :]
+-            if after.startswith("\n"):
+-                after = after[1:]
+-            markdown_content = after
+-
+-    # Default name to file stem if missing (preserves legacy behavior)
+-    if "name" not in frontmatter:
+-        frontmatter["name"] = path.stem
+-    if "description" not in frontmatter:
+-        frontmatter["description"] = frontmatter.get("name", path.stem)
+-
+-    parser = SkillParser()
+-    try:
+-        return parser.parse_frontmatter(frontmatter, markdown_content=markdown_content)
+-    except SkillParseError:
+-        # Legacy fallback — build manifest directly without strict validation
+-        return SkillManifest(
+-            name=str(frontmatter.get("name", path.stem)),
+-            description=str(frontmatter.get("description", "")),
+-            version=str(frontmatter.get("version", "0.1.0")),
+-            author=str(frontmatter.get("author", "")),
+-            tags=list(frontmatter.get("tags", []) or []),
+-            required_capabilities=list(
+-                frontmatter.get("required_capabilities", []) or []
+-            ),
+-            user_invocable=bool(frontmatter.get("user_invocable", True)),
+-            disable_model_invocation=bool(
+-                frontmatter.get("disable_model_invocation", False)
+-            ),
+-            markdown_content=markdown_content,
+-        )
++def load_skill_markdown(
++    path: str | Path,
++    *,
++    verify_signature: bool = False,
++    public_key: Optional[bytes] = None,
++    scan_for_injection: bool = False,
++) -> SkillManifest:
++    """Carrega uma skill de um SKILL.md."""
++    manifesto = _ler_markdown(Path(path))
++    return _verificar(
++        manifesto,
++        verify_signature=verify_signature,
++        public_key=public_key,
++        scan_for_injection=scan_for_injection,
++    )
+ 
+ 
+-def load_skill_directory(path: str | Path) -> SkillManifest:
+-    """Load a skill from a directory containing ``skill.toml`` and/or ``SKILL.md``.
++def load_skill_directory(
++    path: str | Path,
++    *,
++    verify_signature: bool = False,
++    public_key: Optional[bytes] = None,
++    scan_for_injection: bool = False,
++) -> SkillManifest:
++    """Carrega uma skill de um diretório com ``skill.toml`` e/ou ``SKILL.md``.
+ 
+-    - If only ``skill.toml`` is present the manifest is loaded from TOML.
+-    - If only ``SKILL.md`` is present the manifest is loaded from markdown.
+-    - If both are present the TOML manifest takes precedence for structured
+-      fields and ``markdown_content`` is merged in from the markdown file.
+-    - If neither is present a ``FileNotFoundError`` is raised.
++    Com os dois, o TOML manda nos campos estruturados e o corpo vem do
++    SKILL.md. A verificação acontece sobre o manifesto já combinado.
+     """
+     path = Path(path)
+     toml_path = path / "skill.toml"
+     md_path = path / "SKILL.md"
++    tem_toml, tem_md = toml_path.exists(), md_path.exists()
+ 
+-    has_toml = toml_path.exists()
+-    has_md = md_path.exists()
+-
+-    if not has_toml and not has_md:
++    if not tem_toml and not tem_md:
+         raise FileNotFoundError(
+             f"No skill.toml or SKILL.md found in directory '{path}'"
+         )
+ 
+-    if has_toml:
+-        manifest = load_skill(toml_path)
+-        if has_md:
+-            md_manifest = load_skill_markdown(md_path)
+-            # Merge markdown content into the TOML-sourced manifest
+-            manifest = SkillManifest(
+-                name=manifest.name,
+-                version=manifest.version,
+-                description=manifest.description,
+-                author=manifest.author,
+-                steps=manifest.steps,
+-                required_capabilities=manifest.required_capabilities,
+-                signature=manifest.signature,
+-                metadata=manifest.metadata,
+-                tags=manifest.tags,
+-                depends=manifest.depends,
+-                user_invocable=manifest.user_invocable,
+-                disable_model_invocation=manifest.disable_model_invocation,
+-                markdown_content=md_manifest.markdown_content,
+-            )
++    if tem_toml:
++        manifesto = _ler_toml(toml_path)
++        if tem_md:
++            manifesto.markdown_content = _ler_markdown(md_path).markdown_content
+     else:
+-        # Only markdown present
+-        manifest = load_skill_markdown(md_path)
++        manifesto = _ler_markdown(md_path)
++
++    return _verificar(
++        manifesto,
++        verify_signature=verify_signature,
++        public_key=public_key,
++        scan_for_injection=scan_for_injection,
++    )
++
++
++def discover_skills(
++    directory: str | Path,
++    *,
++    verify_signature: bool = False,
++    public_key: Optional[bytes] = None,
++    scan_for_injection: bool = False,
++) -> list[SkillManifest]:
++    """Varre um diretório e carrega as skills válidas.
+ 
+-    # Promote .source file's source field into manifest.metadata.openjarvis.source
+-    source_data = _read_source_metadata(path)
+-    if source_data:
+-        # Extract just the source name (e.g. "hermes" from "hermes:apple-notes")
+-        source_str = source_data.get("source", "")
+-        source_name = source_str.partition(":")[0] if source_str else ""
+-        if source_name:
+-            new_metadata = dict(manifest.metadata) if manifest.metadata else {}
+-            oj = dict(new_metadata.get("openjarvis", {}) or {})
+-            oj["source"] = source_name
+-            new_metadata["openjarvis"] = oj
+-            manifest.metadata = new_metadata
+-
+-    return manifest
+-
+-
+-def discover_skills(directory: str | Path) -> list[SkillManifest]:
+-    """Scan a directory for skill definitions and load them.
+-
+-    Handles three layouts:
+-    - Flat ``*.toml`` files directly inside *directory*.
+-    - Skill directories: ``<directory>/<name>/{skill.toml,SKILL.md}``.
+-    - Sourced layout: ``<directory>/<source>/<name>/{skill.toml,SKILL.md}``.
++    Layouts: ``*.toml`` soltos, ``<dir>/<nome>/{skill.toml,SKILL.md}`` e
++    ``<dir>/<origem>/<nome>/...``. Skill que falha (inclusive na verificação)
++    é registrada no log e IGNORADA; as demais continuam.
+     """
+-    directory = Path(directory).expanduser()
+-    if not directory.exists():
++    diretorio = Path(directory).expanduser()
++    if not diretorio.exists():
+         return []
+ 
+-    manifests: list[SkillManifest] = []
++    opcoes = dict(
++        verify_signature=verify_signature,
++        public_key=public_key,
++        scan_for_injection=scan_for_injection,
++    )
++    manifestos: list[SkillManifest] = []
+ 
+-    # Flat *.toml files at the top level
+-    for toml_file in sorted(directory.glob("*.toml")):
++    def _tentar(carregar, alvo: Path) -> None:
+         try:
+-            manifests.append(load_skill(toml_file))
+-        except Exception as exc:
+-            LOGGER.warning("Failed to load skill from %s: %s", toml_file, exc)
+-            continue
++            manifestos.append(carregar(alvo, **opcoes))
++        except Exception as exc:  # noqa: BLE001 — uma skill ruim não derruba as outras
++            LOGGER.warning("Skill ignorada (%s): %s", alvo, exc)
++
++    for arquivo in sorted(diretorio.glob("*.toml")):
++        _tentar(load_skill, arquivo)
+ 
+-    # Walk one or two levels deep looking for skill packages
+-    for child in sorted(directory.iterdir()):
+-        if not child.is_dir():
++    for filho in sorted(diretorio.iterdir()):
++        if not filho.is_dir() or filho.is_symlink():
+             continue
+-        # Direct skill package: <child>/{skill.toml,SKILL.md}
+-        if (child / "skill.toml").exists() or (child / "SKILL.md").exists():
+-            try:
+-                manifests.append(load_skill_directory(child))
+-            except Exception as exc:
+-                LOGGER.warning("Failed to load skill from %s: %s", child, exc)
+-                continue
++        if (filho / "skill.toml").exists() or (filho / "SKILL.md").exists():
++            _tentar(load_skill_directory, filho)
+             continue
+-
+-        # Sourced layout: <child>/<grandchild>/{skill.toml,SKILL.md}
+-        for grandchild in sorted(child.iterdir()):
+-            if not grandchild.is_dir():
++        for neto in sorted(filho.iterdir()):
++            if not neto.is_dir() or neto.is_symlink():
+                 continue
+-            if (grandchild / "skill.toml").exists() or (
+-                grandchild / "SKILL.md"
+-            ).exists():
+-                try:
+-                    manifests.append(load_skill_directory(grandchild))
+-                except Exception as exc:
+-                    LOGGER.warning("Failed to load skill from %s: %s", grandchild, exc)
+-                    continue
++            if (neto / "skill.toml").exists() or (neto / "SKILL.md").exists():
++                _tentar(load_skill_directory, neto)
+ 
+-    return manifests
++    return manifestos
+ 
+ 
+ __all__ = [
++    "SkillInjectionError",
++    "SkillSignatureError",
++    "discover_skills",
+     "load_skill",
+-    "load_skill_markdown",
+     "load_skill_directory",
+-    "discover_skills",
++    "load_skill_markdown",
+ ]

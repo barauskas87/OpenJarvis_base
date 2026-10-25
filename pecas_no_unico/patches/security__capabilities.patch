@@ -1,0 +1,308 @@
+--- a/src/openjarvis/security/capabilities.py
++++ b/src/openjarvis/security/capabilities.py
+@@ -1,10 +1,22 @@
+-"""RBAC capability system — fine-grained permission model for tool dispatch."""
++"""RBAC de capacidades em Python puro (sem Rust), negando por padrão.
++
++Patches N12/N16: no upstream a checagem só existia no Rust, o padrão era
++"liberar tudo" e a versão Python era código legado com semântica diferente.
++Aqui:
++
++- a decisão é toda Python e testada;
++- o padrão é NEGAR (``default_deny=True``); liberar tudo exige pedir
++  explicitamente com ``CapabilityPolicy.permissiva()``;
++- negação explícita sempre vence;
++- concessão com padrão de recurso (``pattern``) só vale quando o recurso casa.
++"""
+ 
+ from __future__ import annotations
+ 
+ import fnmatch
+ import json
+ import logging
++import threading
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from pathlib import Path
+@@ -14,7 +26,7 @@
+ 
+ 
+ class Capability(str, Enum):
+-    """Fine-grained capability labels."""
++    """Rótulos de capacidade."""
+ 
+     FILE_READ = "file:read"
+     FILE_WRITE = "file:write"
+@@ -30,177 +42,159 @@
+ 
+ @dataclass(slots=True)
+ class CapabilityGrant:
+-    """A single capability grant for an agent."""
++    """Uma concessão de capacidade para um agente."""
+ 
+-    capability: str  # Capability value or glob pattern
+-    pattern: str = "*"  # resource glob pattern
++    capability: str  # valor de Capability ou glob
++    pattern: str = "*"  # glob do recurso (nome da ferramenta)
+ 
+ 
+ @dataclass(slots=True)
+ class AgentPolicy:
+-    """Policy for a specific agent."""
++    """Política de um agente específico."""
+ 
+     agent_id: str
+     grants: List[CapabilityGrant] = field(default_factory=list)
+-    deny: List[str] = field(default_factory=list)  # explicit denials
++    deny: List[str] = field(default_factory=list)  # negações explícitas
+ 
+ 
+ class CapabilityPolicy:
+-    """RBAC capability policy for tool dispatch.
++    """Política RBAC de capacidades para despacho de ferramentas.
+ 
+-    Checks whether an agent has the required capability to invoke a tool.
+-    Policy can be loaded from a JSON file or configured programmatically.
++    Regras de decisão (``check``):
+ 
+-    Default policy: if no explicit policy exists for an agent, all
+-    capabilities are granted (open by default). Set ``default_deny=True``
+-    to flip to deny-by-default.
++    1. Escolhe a política: a do próprio agente; se ele não tiver, a do agente
++       curinga ``_default``; se nenhuma existir, vale ``default_deny``.
++    2. Qualquer ``deny`` que case com a capacidade nega, sempre.
++    3. Qualquer concessão que case (capacidade e recurso) permite.
++    4. Sem concessão que case: nega se ``default_deny``, senão permite.
+     """
+ 
++    _DEFAULT_AGENT = "_default"
++
+     def __init__(
+         self,
+         *,
+         policy_path: Optional[str] = None,
+-        default_deny: bool = False,
++        default_deny: bool = True,
+     ) -> None:
+         self._policies: Dict[str, AgentPolicy] = {}
+         self._default_deny = default_deny
+-
+-        from openjarvis._rust_bridge import get_rust_module
+-
+-        _rust = get_rust_module()
+-        self._rust_impl = _rust.CapabilityPolicy(default_deny=default_deny)
+-
++        self._lock = threading.RLock()
+         if policy_path:
+             self._load_file(Path(policy_path))
+ 
++    @classmethod
++    def permissiva(cls) -> "CapabilityPolicy":
++        """Política que libera tudo. Use só em testes/ambientes de confiança."""
++        return cls(default_deny=False)
++
+     def grant(self, agent_id: str, capability: str, pattern: str = "*") -> None:
+-        """Grant a capability to an agent."""
+-        policy = self._policies.setdefault(
+-            agent_id,
+-            AgentPolicy(agent_id=agent_id),
+-        )
+-        policy.grants.append(CapabilityGrant(capability=capability, pattern=pattern))
+-        self._rust_impl.grant(agent_id, capability, pattern)
++        """Concede uma capacidade a um agente."""
++        with self._lock:
++            politica = self._policies.setdefault(
++                agent_id, AgentPolicy(agent_id=agent_id)
++            )
++            politica.grants.append(
++                CapabilityGrant(capability=capability, pattern=pattern)
++            )
+ 
+     def deny(self, agent_id: str, capability: str) -> None:
+-        """Explicitly deny a capability to an agent."""
+-        policy = self._policies.setdefault(
+-            agent_id,
+-            AgentPolicy(agent_id=agent_id),
+-        )
+-        policy.deny.append(capability)
+-        self._rust_impl.deny(agent_id, capability)
+-
+-    _DEFAULT_AGENT = "_default"
++        """Nega explicitamente uma capacidade a um agente."""
++        with self._lock:
++            politica = self._policies.setdefault(
++                agent_id, AgentPolicy(agent_id=agent_id)
++            )
++            politica.deny.append(capability)
+ 
+     def check(self, agent_id: str, capability: str, resource: str = "") -> bool:
+-        """Check whether *agent_id* has *capability* for *resource*.
+-
+-        Falls back to the ``_default`` wildcard agent's grants only when
+-        *agent_id* has no explicit policy of its own. This lets a baseline be
+-        granted once via
+-        ``grant("_default", ...)`` instead of needing to know every
+-        dynamically-created managed-agent UUID ahead of time while preserving
+-        the invariant that an agent-specific denial always wins.
+-        """
+-        if (
+-            not agent_id
+-            or agent_id == self._DEFAULT_AGENT
+-            or agent_id in self._policies
+-        ):
+-            return self._rust_impl.check(agent_id, capability, resource)
+-        if self._DEFAULT_AGENT in self._policies:
+-            return self._rust_impl.check(self._DEFAULT_AGENT, capability, resource)
+-        return self._rust_impl.check(agent_id, capability, resource)
+-
+-    def _check_python(self, agent_id: str, capability: str, resource: str = "") -> bool:
+-        """Legacy Python check — kept for reference only."""
+-        policy = self._policies.get(agent_id)
+-        if policy is None:
+-            # No explicit policy — use default
+-            return not self._default_deny
+-
+-        # Explicit denials take precedence
+-        for denied in policy.deny:
+-            if fnmatch.fnmatch(capability, denied):
+-                return False
+-
+-        # Check grants
+-        for grant in policy.grants:
+-            if fnmatch.fnmatch(capability, grant.capability):
+-                if resource and grant.pattern != "*":
+-                    if fnmatch.fnmatch(resource, grant.pattern):
+-                        return True
+-                else:
++        """Diz se ``agent_id`` pode usar ``capability`` sobre ``resource``."""
++        capability = getattr(capability, "value", capability)
++        with self._lock:
++            politica = self._policies.get(agent_id) if agent_id else None
++            if politica is None:
++                politica = self._policies.get(self._DEFAULT_AGENT)
++            if politica is None:
++                return not self._default_deny
++
++            for negada in politica.deny:
++                if fnmatch.fnmatchcase(capability, negada):
++                    return False
++
++            for concessao in politica.grants:
++                if not fnmatch.fnmatchcase(capability, concessao.capability):
++                    continue
++                if concessao.pattern == "*":
++                    return True
++                if resource and fnmatch.fnmatchcase(resource, concessao.pattern):
+                     return True
+ 
+-        # No matching grant found
+-        return not self._default_deny
++            return not self._default_deny
+ 
+     def list_grants(self, agent_id: str) -> List[CapabilityGrant]:
+-        """List all grants for an agent."""
+-        policy = self._policies.get(agent_id)
+-        return list(policy.grants) if policy else []
++        """Lista as concessões de um agente."""
++        with self._lock:
++            politica = self._policies.get(agent_id)
++            return list(politica.grants) if politica else []
+ 
+     def list_agents(self) -> List[str]:
+-        """List all agents with explicit policies."""
+-        return list(self._policies.keys())
++        """Lista os agentes com política explícita."""
++        with self._lock:
++            return list(self._policies.keys())
+ 
+     def _load_file(self, path: Path) -> None:
+-        """Load an explicitly configured policy, rejecting incomplete policy data."""
+-        # A missing/malformed file must not silently discard configured denies.
+-        # Validate the complete document before applying any grants.
+-        data = json.loads(path.read_text())
+-        if not isinstance(data, dict) or not isinstance(data.get("agents"), list):
++        """Carrega política de arquivo JSON, rejeitando dados incompletos."""
++        dados = json.loads(path.read_text(encoding="utf-8"))
++        if not isinstance(dados, dict) or not isinstance(dados.get("agents"), list):
+             raise ValueError("Capability policy must contain an agents list")
+-        for agent_data in data["agents"]:
+-            if not isinstance(agent_data, dict):
++        for agente in dados["agents"]:
++            if not isinstance(agente, dict):
+                 raise ValueError("Capability policy agent must be an object")
+-            agent_id = agent_data.get("agent_id")
++            agent_id = agente.get("agent_id")
+             if not isinstance(agent_id, str) or not agent_id.strip():
+                 raise ValueError("Capability policy agent_id must be a nonempty string")
+-            grants = agent_data.get("grants", [])
+-            denied = agent_data.get("deny", [])
+-            if not isinstance(grants, list) or not isinstance(denied, list):
++            concessoes = agente.get("grants", [])
++            negadas = agente.get("deny", [])
++            if not isinstance(concessoes, list) or not isinstance(negadas, list):
+                 raise ValueError("Capability policy grants and deny must be lists")
+-            for grant in grants:
++            for g in concessoes:
+                 if (
+-                    not isinstance(grant, dict)
+-                    or not isinstance(grant.get("capability"), str)
+-                    or not grant["capability"].strip()
+-                    or not isinstance(grant.get("pattern", "*"), str)
++                    not isinstance(g, dict)
++                    or not isinstance(g.get("capability"), str)
++                    or not g["capability"].strip()
++                    or not isinstance(g.get("pattern", "*"), str)
+                 ):
+                     raise ValueError(
+                         "Capability policy grant must specify a capability"
+                     )
+-            if any(not isinstance(cap, str) or not cap.strip() for cap in denied):
++            if any(not isinstance(c, str) or not c.strip() for c in negadas):
+                 raise ValueError("Capability policy deny entries must be strings")
+ 
+-        for agent_data in data["agents"]:
+-            agent_id = agent_data["agent_id"]
+-            # An explicit empty policy is still an identity-specific policy;
+-            # it must not accidentally inherit the wildcard's grants.
+-            self._policies.setdefault(agent_id, AgentPolicy(agent_id=agent_id))
+-            for grant in agent_data.get("grants", []):
+-                self.grant(agent_id, grant["capability"], grant.get("pattern", "*"))
+-            for denied in agent_data.get("deny", []):
+-                self.deny(agent_id, denied)
++        for agente in dados["agents"]:
++            agent_id = agente["agent_id"]
++            with self._lock:
++                # Política explícita vazia continua sendo política do agente:
++                # ela não herda as concessões do curinga.
++                self._policies.setdefault(agent_id, AgentPolicy(agent_id=agent_id))
++            for g in agente.get("grants", []):
++                self.grant(agent_id, g["capability"], g.get("pattern", "*"))
++            for negada in agente.get("deny", []):
++                self.deny(agent_id, negada)
+ 
+     def save(self, path: Path) -> None:
+-        """Save policy to a JSON file."""
+-        agents = []
+-        for agent_id, policy in self._policies.items():
+-            agents.append(
++        """Salva a política em JSON."""
++        with self._lock:
++            agentes = [
+                 {
+                     "agent_id": agent_id,
+                     "grants": [
+                         {"capability": g.capability, "pattern": g.pattern}
+-                        for g in policy.grants
++                        for g in politica.grants
+                     ],
+-                    "deny": policy.deny,
++                    "deny": list(politica.deny),
+                 }
+-            )
+-        path.write_text(json.dumps({"agents": agents}, indent=2))
++                for agent_id, politica in self._policies.items()
++            ]
++        path.write_text(json.dumps({"agents": agentes}, indent=2), encoding="utf-8")
+ 
+ 
+ # Canonical capability requirements for every in-tree tool.  This table is a

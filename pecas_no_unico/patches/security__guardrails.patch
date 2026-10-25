@@ -1,0 +1,186 @@
+--- a/src/openjarvis/security/guardrails.py
++++ b/src/openjarvis/security/guardrails.py
+@@ -9,14 +9,11 @@
+ from openjarvis.core.types import Message
+ from openjarvis.engine._stubs import InferenceEngine, StreamChunk
+ from openjarvis.security._stubs import BaseScanner
++from openjarvis.security.boundary import SecurityBlockError
+ from openjarvis.security.scanner import PIIScanner, SecretScanner
+ from openjarvis.security.types import RedactionMode, ScanResult
+ 
+ 
+-class SecurityBlockError(Exception):
+-    """Raised when mode is BLOCK and security findings are detected."""
+-
+-
+ class GuardrailsEngine(InferenceEngine):
+     """Wraps an existing ``InferenceEngine`` with security scanning.
+ 
+@@ -44,7 +41,7 @@
+         engine: InferenceEngine,
+         *,
+         scanners: Optional[List[BaseScanner]] = None,
+-        mode: RedactionMode = RedactionMode.WARN,
++        mode: RedactionMode = RedactionMode.REDACT,
+         scan_input: bool = True,
+         scan_output: bool = True,
+         bus: Optional[EventBus] = None,
+@@ -223,6 +220,19 @@
+ 
+         return response
+ 
++    def _saida_exige_buffer(self) -> bool:
++        """Em REDACT/BLOCK a saída só pode sair depois de varrida.
++
++        Patch N17: o upstream entregava os tokens antes de varrer e só
++        alertava no fim ("post-hoc"), então REDACT e BLOCK não valiam para
++        respostas em streaming. Agora, nesses modos, a resposta é acumulada,
++        varrida e só então liberada (perde-se o efeito "token a token").
++        """
++        return self._scan_output and self._mode in (
++            RedactionMode.REDACT,
++            RedactionMode.BLOCK,
++        )
++
+     async def stream(
+         self,
+         messages: Sequence[Message],
+@@ -232,9 +242,10 @@
+         max_tokens: int = 1024,
+         **kwargs: Any,
+     ) -> AsyncIterator[str]:
+-        """Scan input before yielding tokens; scan output post-hoc for alerts."""
++        """Varre a entrada; a saída é varrida antes de liberar (REDACT/BLOCK)."""
+         messages = self._prepare_messages(messages)
+-        accumulated = []
++        acumulado: list[str] = []
++        buffer = self._saida_exige_buffer()
+         async for token in self._engine.stream(
+             messages,
+             model=model,
+@@ -242,31 +253,24 @@
+             max_tokens=max_tokens,
+             **kwargs,
+         ):
+-            accumulated.append(token)
+-            yield token
+-
+-        # Post-hoc scan of accumulated output for logging only
+-        if self._scan_output:
+-            full_output = "".join(accumulated)
+-            if full_output:
+-                result = self._scan_text(full_output)
+-                if not result.clean and self._bus:
+-                    finding_dicts = [
+-                        {
+-                            "pattern": f.pattern_name,
+-                            "threat": f.threat_level.value,
+-                            "description": f.description,
+-                        }
+-                        for f in result.findings
+-                    ]
+-                    self._bus.publish(
+-                        EventType.SECURITY_ALERT,
+-                        {
+-                            "direction": "output",
+-                            "findings": finding_dicts,
+-                            "mode": "stream_post_hoc",
+-                        },
+-                    )
++            acumulado.append(token)
++            if not buffer:
++                yield token
++
++        completo = "".join(acumulado)
++        if buffer:
++            if completo:
++                resultado = self._scan_text(completo)
++                if not resultado.clean:
++                    completo = self._handle_findings(completo, resultado, "output")
++            if completo:
++                yield completo
++            return
++
++        if self._scan_output and completo:
++            resultado = self._scan_text(completo)
++            if not resultado.clean:
++                self._handle_findings(completo, resultado, "output")
+ 
+     async def stream_full(
+         self,
+@@ -277,9 +281,11 @@
+         max_tokens: int = 1024,
+         **kwargs: Any,
+     ) -> AsyncIterator["StreamChunk"]:
+-        """Scan input before yielding chunks; scan output post-hoc for alerts."""
++        """Como ``stream``, mas preservando tool_calls/finish_reason/usage."""
+         messages = self._prepare_messages(messages)
+-        accumulated: list[str] = []
++        buffer = self._saida_exige_buffer()
++        pedacos: list[StreamChunk] = []
++        textos: list[str] = []
+         async for chunk in self._engine.stream_full(
+             messages,
+             model=model,
+@@ -288,31 +294,37 @@
+             **kwargs,
+         ):
+             if chunk.content:
+-                accumulated.append(chunk.content)
+-            yield chunk
+-
+-        # Post-hoc scan of accumulated output
+-        if self._scan_output:
+-            full_output = "".join(accumulated)
+-            if full_output:
+-                result = self._scan_text(full_output)
+-                if not result.clean and self._bus:
+-                    finding_dicts = [
+-                        {
+-                            "pattern": f.pattern_name,
+-                            "threat": f.threat_level.value,
+-                            "description": f.description,
+-                        }
+-                        for f in result.findings
+-                    ]
+-                    self._bus.publish(
+-                        EventType.SECURITY_ALERT,
+-                        {
+-                            "direction": "output",
+-                            "findings": finding_dicts,
+-                            "mode": "stream_full_post_hoc",
+-                        },
++                textos.append(chunk.content)
++            if buffer:
++                pedacos.append(chunk)
++            else:
++                yield chunk
++
++        completo = "".join(textos)
++        if buffer:
++            liberado = completo
++            if completo:
++                resultado = self._scan_text(completo)
++                if not resultado.clean:
++                    liberado = self._handle_findings(completo, resultado, "output")
++            if liberado:
++                yield StreamChunk(content=liberado)
++            for chunk in pedacos:
++                if chunk.tool_calls or chunk.finish_reason or chunk.usage:
++                    yield StreamChunk(
++                        content=None,
++                        tool_calls=chunk.tool_calls,
++                        finish_reason=chunk.finish_reason,
++                        usage=chunk.usage,
++                        content_blocks=chunk.content_blocks,
++                        tool_results=chunk.tool_results,
+                     )
++            return
++
++        if self._scan_output and completo:
++            resultado = self._scan_text(completo)
++            if not resultado.clean:
++                self._handle_findings(completo, resultado, "output")
+ 
+     def list_models(self) -> List[str]:
+         """Delegate to wrapped engine."""

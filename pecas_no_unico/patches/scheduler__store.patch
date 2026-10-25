@@ -1,0 +1,17 @@
+--- a/src/openjarvis/scheduler/store.py
++++ b/src/openjarvis/scheduler/store.py
+@@ -54,8 +54,14 @@
+ 
+     def __init__(self, db_path: str | Path) -> None:
+         self._db_path = str(db_path)
++        if self._db_path != ":memory:":
++            # Patch: o banco guarda prompts e resultados; só o dono lê (0600).
++            from openjarvis.security.file_utils import secure_create
++
++            secure_create(Path(self._db_path))
+         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+         self._conn.row_factory = sqlite3.Row
++        self._conn.execute("PRAGMA journal_mode=WAL")
+         self._conn.execute(_CREATE_TASKS_TABLE)
+         self._conn.execute(_CREATE_LOGS_TABLE)
+         self._conn.commit()

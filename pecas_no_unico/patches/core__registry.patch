@@ -1,0 +1,27 @@
+--- a/src/openjarvis/core/registry.py
++++ b/src/openjarvis/core/registry.py
+@@ -158,16 +158,6 @@
+     """Registry for data source connectors (Gmail, Slack, etc.)."""
+ 
+ 
+-class MinerRegistry(RegistryBase[Any]):
+-    """Registry for Pearl mining provider implementations.
+-
+-    Each provider implements the ``MiningProvider`` ABC defined in
+-    ``openjarvis.mining._stubs``. Registry keys are short lowercase strings
+-    such as ``"vllm-pearl"`` (CUDA + Hopper) and (future) ``"mlx-pearl"``,
+-    ``"llamacpp-pearl-metal"``, ``"ollama-pearl"``.
+-    """
+-
+-
+ __all__ = [
+     "AgentRegistry",
+     "BenchmarkRegistry",
+@@ -178,7 +168,6 @@
+     "FactStoreRegistry",
+     "LearningRegistry",
+     "MemoryRegistry",
+-    "MinerRegistry",
+     "ModelRegistry",
+     "RegistryBase",
+     "RouterPolicyRegistry",

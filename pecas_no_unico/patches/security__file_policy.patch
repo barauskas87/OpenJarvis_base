@@ -1,0 +1,172 @@
+--- a/src/openjarvis/security/file_policy.py
++++ b/src/openjarvis/security/file_policy.py
+@@ -1,10 +1,24 @@
+-"""File sensitivity policy — block access to secrets, credentials, and keys."""
++"""Política de arquivos sensíveis — bloqueia segredos, credenciais e chaves.
++
++Patch N19: o upstream não cobria o próprio diretório de estado do projeto
++(``config.toml`` com tokens, ``connectors/*.json`` com OAuth, ``.vault_key``),
++comparava nomes com diferença de maiúsculas/minúsculas no Linux (``.ENV``
++passava) e dependia do Rust quando disponível. Aqui:
++
++- a comparação ignora maiúsculas/minúsculas em qualquer sistema;
++- nomes novos: ``.vault_key``, ``id_ecdsa``, ``*.ppk``, ``*.kdbx``, ``.npmrc``…;
++- diretórios inteiros protegidos (``.ssh``, ``.aws``, ``.gnupg``, ``.kube``…);
++- tudo dentro do diretório de estado do Nó (``get_config_dir()``) é sensível.
++"""
+ 
+ from __future__ import annotations
+ 
++import fnmatch
+ from pathlib import Path
+ from typing import Iterable, Iterator, List, Union
+ 
++from openjarvis.core.paths import get_config_dir
++
+ DEFAULT_SENSITIVE_PATTERNS: frozenset[str] = frozenset(
+     {
+         ".env",
+@@ -13,16 +27,25 @@
+         ".secret",
+         "*.secrets",
+         "credentials.*",
++        "client_secret*.json",
+         "*.pem",
+         "*.key",
+         "*.p12",
+         "*.pfx",
+         "*.jks",
++        "*.ppk",
++        "*.kdbx",
++        ".vault_key",
+         "id_rsa",
++        "id_dsa",
++        "id_ecdsa",
+         "id_ed25519",
+         ".htpasswd",
+         ".pgpass",
+         ".netrc",
++        ".npmrc",
++        ".pypirc",
++        ".dockercfg",
+         ".git-credentials",
+         "credentials",
+         "shadow",
+@@ -30,68 +53,84 @@
+         "pass.txt",
+         "password.txt",
+         "passwords.txt",
++        "senha.txt",
++        "senhas.txt",
+     }
+ )
+ 
++# Diretórios cujo conteúdo inteiro é sensível (qualquer componente do caminho).
++DEFAULT_SENSITIVE_DIRS: frozenset[str] = frozenset(
++    {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
++)
++
+ 
+ def is_sensitive_file(path: Union[str, Path]) -> bool:
+-    """Return ``True`` if *path* matches a sensitive file pattern.
++    """Diz se ``path`` casa com a política de arquivos sensíveis.
+ 
+-    Checks the original path, symlink targets, and resolved path against
+-    ``DEFAULT_SENSITIVE_PATTERNS``. A symlink must not bypass the policy by
+-    hiding a sensitive name anywhere in its chain.
+-    Uses the Rust implementation when available, falls back to Python.
++    Verifica o caminho original, cada alvo da cadeia de symlinks e o caminho
++    resolvido, para que um symlink não esconda um nome sensível.
+     """
+-    try:
+-        from openjarvis._rust_bridge import get_rust_module
+-
+-        _rust = get_rust_module()
+-        check = _rust.is_sensitive_file
+-    except ImportError:
+-        check = _is_sensitive_file_py
+-
+-    return any(check(str(candidate)) for candidate in _paths_for_policy(Path(path)))
++    return any(_caminho_sensivel(c) for c in _paths_for_policy(Path(path)))
+ 
+ 
+ def _paths_for_policy(path: Path) -> Iterator[Path]:
+-    """Keep sensitive names that full resolution would discard."""
++    """Gera o caminho, cada salto de symlink e o caminho resolvido."""
+     yield path
+-    candidate = path
++    candidato = path
+     for _ in range(40):
+         try:
+-            target = candidate.readlink()
+-        except OSError:
++            alvo = candidato.readlink()
++        except (OSError, ValueError):
+             break
+-        candidate = target if target.is_absolute() else candidate.parent / target
+-        yield candidate
++        candidato = alvo if alvo.is_absolute() else candidato.parent / alvo
++        yield candidato
+ 
+     try:
+-        # Also resolve symlinks in parent directories and normalize the target.
+         yield path.resolve(strict=False)
+     except (OSError, RuntimeError):
+-        # Missing files and loops retain the checks above. The filesystem
+-        # operation will report its own error when a path is not usable.
+         return
+ 
+ 
+-def _is_sensitive_file_py(path_str: str) -> bool:
+-    """Pure-Python fallback for sensitive file detection."""
+-    import fnmatch
+-
+-    p = Path(path_str)
+-    name = p.name
+-    for pattern in DEFAULT_SENSITIVE_PATTERNS:
+-        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(str(p), pattern):
++def _dentro_do_estado(caminho: Path) -> bool:
++    """True se o caminho está dentro do diretório de estado do Nó."""
++    try:
++        raiz = get_config_dir()
++    except Exception:  # raiz inválida: não decide por aqui
++        return False
++    try:
++        alvo = caminho.resolve(strict=False)
++    except (OSError, RuntimeError):
++        alvo = caminho
++    try:
++        alvo.relative_to(raiz)
++    except ValueError:
++        return False
++    return True
++
++
++def _caminho_sensivel(caminho: Path) -> bool:
++    nome = caminho.name.lower()
++    texto = str(caminho).replace("\\", "/").lower()
++    for padrao in DEFAULT_SENSITIVE_PATTERNS:
++        if fnmatch.fnmatchcase(nome, padrao) or fnmatch.fnmatchcase(texto, padrao):
+             return True
+-    return False
++    partes = {p.lower() for p in caminho.parts}
++    if partes & DEFAULT_SENSITIVE_DIRS:
++        return True
++    return _dentro_do_estado(caminho)
++
++
++# Compatibilidade com o nome usado no upstream.
++_is_sensitive_file_py = lambda path_str: _caminho_sensivel(Path(path_str))  # noqa: E731
+ 
+ 
+ def filter_sensitive_paths(paths: Iterable[Union[str, Path]]) -> List[Path]:
+-    """Return only non-sensitive paths from *paths*."""
++    """Devolve só os caminhos que não são sensíveis."""
+     return [Path(p) for p in paths if not is_sensitive_file(p)]
+ 
+ 
+ __all__ = [
++    "DEFAULT_SENSITIVE_DIRS",
+     "DEFAULT_SENSITIVE_PATTERNS",
+     "filter_sensitive_paths",
+     "is_sensitive_file",

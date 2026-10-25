@@ -1,0 +1,163 @@
+--- a/src/openjarvis/skills/executor.py
++++ b/src/openjarvis/skills/executor.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import contextvars
+ import json
+ import re
+ from dataclasses import dataclass, field
+@@ -22,6 +23,19 @@
+     context: Dict[str, Any] = field(default_factory=dict)
+ 
+ 
++# Profundidade de sub-skills em execução (por contexto/thread).
++# Patch N2/N6: o upstream não limitava a recursão de ``skill_name`` em tempo de
++# execução (só o grafo estático de dependências).
++MAX_PROFUNDIDADE = 5
++_profundidade: contextvars.ContextVar[int] = contextvars.ContextVar(
++    "openjarvis_skill_profundidade", default=0
++)
++
++
++class TemplateError(ValueError):
++    """O ``arguments_template`` não é um JSON válido com marcadores em strings."""
++
++
+ # Resolver callback: given a skill name and the current context, returns a SkillResult.
+ SkillResolver = Callable[[str, Dict[str, Any]], SkillResult]
+ 
+@@ -38,15 +52,14 @@
+         tool_executor: ToolExecutor,
+         *,
+         bus: Optional[EventBus] = None,
+-        allowed_capabilities: Optional[Set[str]] = None,
++        allowed_capabilities: Optional[Set[str]] = frozenset(),  # type: ignore[assignment]
+     ) -> None:
+         self._tool_executor = tool_executor
+         self._bus = bus
+         self._skill_resolver: Optional[SkillResolver] = None
+-        # None means "no capability policy" — every skill runs, matching the
+-        # behavior before capability enforcement existed. Pass a set (even an
+-        # empty one) to enforce: skills whose required_capabilities are not a
+-        # subset of it are blocked before any step runs.
++        # Patch N4: o padrão agora IMPÕE (conjunto vazio): skill que declara
++        # capacidades fora do conjunto é bloqueada antes de qualquer passo.
++        # ``None`` desliga a imposição (só para testes/ambientes de confiança).
+         self._allowed_capabilities: Optional[Set[str]] = allowed_capabilities
+ 
+     def set_skill_resolver(self, resolver: SkillResolver) -> None:
+@@ -60,6 +73,34 @@
+         initial_context: Optional[Dict[str, Any]] = None,
+     ) -> SkillResult:
+         """Execute all steps in a skill manifest."""
++        nivel = _profundidade.get()
++        if nivel >= MAX_PROFUNDIDADE:
++            return SkillResult(
++                skill_name=manifest.name,
++                success=False,
++                step_results=[
++                    ToolResult(
++                        tool_name=manifest.name,
++                        content=(
++                            f"Blocked: skill '{manifest.name}' excede a profundidade "
++                            f"máxima de sub-skills ({MAX_PROFUNDIDADE})."
++                        ),
++                        success=False,
++                    )
++                ],
++                context=dict(initial_context or {}),
++            )
++        token = _profundidade.set(nivel + 1)
++        try:
++            return self._executar(manifest, initial_context)
++        finally:
++            _profundidade.reset(token)
++
++    def _executar(
++        self,
++        manifest: SkillManifest,
++        initial_context: Optional[Dict[str, Any]],
++    ) -> SkillResult:
+         missing = (
+             validate_capabilities(manifest, self._allowed_capabilities)
+             if self._allowed_capabilities is not None
+@@ -175,6 +216,8 @@
+             args: Dict[str, Any] = json.loads(rendered_args)
+         except json.JSONDecodeError:
+             args = {}
++        if not isinstance(args, dict):
++            args = {}
+ 
+         child_ctx = {**parent_ctx, **args}
+ 
+@@ -204,16 +247,56 @@
+ 
+     @staticmethod
+     def _render_template(template: str, ctx: Dict[str, Any]) -> str:
+-        """Simple {key} placeholder rendering."""
+-
+-        def _replace(match: re.Match) -> str:
+-            key = match.group(1)
+-            val = ctx.get(key, match.group(0))
+-            if isinstance(val, str):
+-                return val
+-            return json.dumps(val)
+-
+-        return re.sub(r"\{(\w+)\}", _replace, template)
++        """Renderiza o template de forma ESTRUTURAL (a prova de injeção de JSON).
+ 
+-
+-__all__ = ["SkillExecutor", "SkillResolver", "SkillResult"]
++        Patch N2: o upstream trocava ``{chave}`` por texto cru dentro do texto
++        JSON; um valor com aspas (parâmetro do modelo ou SAÍDA de um passo
++        anterior, ou seja, conteúdo web/arquivo) fechava o campo e acrescentava
++        outros. Aqui o template é lido como JSON e a troca acontece só dentro
++        das STRINGS já decodificadas; o resultado é serializado de novo.
++        Se a string inteira é um único marcador e o valor não é texto, o tipo
++        original é preservado.
++
++        O template precisa ser JSON válido (marcadores só dentro de strings);
++        caso contrário levanta ``TemplateError``. Marcadores sem valor no
++        contexto ficam literais, como no upstream.
++        """
++        try:
++            alvo = json.loads(template)
++        except json.JSONDecodeError as exc:
++            raise TemplateError(f"Template não é JSON válido: {exc.msg}") from exc
++
++        marcador = re.compile(r"\{(\w+)\}")
++
++        def _valor_texto(valor: Any) -> str:
++            return valor if isinstance(valor, str) else json.dumps(valor)
++
++        def _trocar(no: Any) -> Any:
++            if isinstance(no, str):
++                inteiro = marcador.fullmatch(no)
++                if inteiro and inteiro.group(1) in ctx:
++                    return ctx[inteiro.group(1)]
++                return marcador.sub(
++                    lambda m: (
++                        _valor_texto(ctx[m.group(1)])
++                        if m.group(1) in ctx
++                        else m.group(0)
++                    ),
++                    no,
++                )
++            if isinstance(no, list):
++                return [_trocar(x) for x in no]
++            if isinstance(no, dict):
++                return {k: _trocar(v) for k, v in no.items()}
++            return no
++
++        return json.dumps(_trocar(alvo), ensure_ascii=False)
++
++
++__all__ = [
++    "MAX_PROFUNDIDADE",
++    "SkillExecutor",
++    "SkillResolver",
++    "SkillResult",
++    "TemplateError",
++]

@@ -1,0 +1,157 @@
+--- a/src/openjarvis/security/rate_limiter.py
++++ b/src/openjarvis/security/rate_limiter.py
+@@ -1,101 +1,106 @@
+-"""Rate limiter -- token bucket algorithm for per-agent/per-tool throttling."""
++"""Limitador de taxa (token bucket) em Python puro.
++
++Patch N16: no upstream o ``RateLimiter`` exigia o módulo Rust e o ``reset``
++tinha código morto depois de um ``return``. Aqui o ``TokenBucket`` (que já
++existia) é o único backend, com limite de buckets para não crescer sem fim.
++"""
+ 
+ from __future__ import annotations
+ 
+ import threading
+ import time
+ from dataclasses import dataclass
+-from typing import Dict, Optional, Tuple
++from typing import Callable, Dict, Optional, Tuple
+ 
+ __all__ = ["RateLimitConfig", "RateLimiter", "TokenBucket"]
+ 
+ 
+ @dataclass(slots=True)
+ class RateLimitConfig:
+-    """Configuration for rate limiting."""
++    """Configuração do limitador."""
+ 
+     requests_per_minute: int = 60
+-    burst_size: int = 10  # max tokens in bucket
++    burst_size: int = 10  # capacidade máxima do balde
+     enabled: bool = True
++    max_buckets: int = 10_000  # teto de chaves distintas em memória
+ 
+ 
+ class TokenBucket:
+-    """Thread-safe token bucket for rate limiting."""
++    """Balde de fichas seguro para threads."""
+ 
+-    def __init__(self, rate: float, capacity: int) -> None:
+-        self._rate = rate  # tokens per second
++    def __init__(
++        self,
++        rate: float,
++        capacity: int,
++        relogio: Callable[[], float] = time.monotonic,
++    ) -> None:
++        if rate <= 0:
++            raise ValueError("rate deve ser positivo")
++        if capacity <= 0:
++            raise ValueError("capacity deve ser positivo")
++        self._rate = rate  # fichas por segundo
+         self._capacity = capacity
+         self._tokens = float(capacity)
+-        self._last_refill = time.monotonic()
++        self._relogio = relogio
++        self._last_refill = relogio()
+         self._lock = threading.Lock()
+ 
+     def consume(self, tokens: int = 1) -> Tuple[bool, float]:
+-        """Try to consume tokens. Returns (allowed, wait_seconds)."""
++        """Tenta consumir fichas. Devolve ``(permitido, segundos_de_espera)``."""
+         with self._lock:
+-            now = time.monotonic()
+-            elapsed = now - self._last_refill
+-            self._tokens = min(
+-                self._capacity,
+-                self._tokens + elapsed * self._rate,
+-            )
+-            self._last_refill = now
+-
++            agora = self._relogio()
++            decorrido = max(0.0, agora - self._last_refill)
++            self._tokens = min(self._capacity, self._tokens + decorrido * self._rate)
++            self._last_refill = agora
+             if self._tokens >= tokens:
+                 self._tokens -= tokens
+                 return True, 0.0
+-            else:
+-                wait = (tokens - self._tokens) / self._rate
+-                return False, wait
++            return False, (tokens - self._tokens) / self._rate
+ 
+     @property
+     def available(self) -> float:
+-        """Current available tokens (approximate)."""
++        """Fichas disponíveis agora (aproximado)."""
+         with self._lock:
+-            now = time.monotonic()
+-            elapsed = now - self._last_refill
+-            return min(self._capacity, self._tokens + elapsed * self._rate)
++            decorrido = max(0.0, self._relogio() - self._last_refill)
++            return min(self._capacity, self._tokens + decorrido * self._rate)
+ 
+ 
+ class RateLimiter:
+-    """Rate limiter with per-key token buckets.
+-
+-    Keys are typically "agent_id:tool_name" or just "agent_id".
+-    """
++    """Limitador com um balde por chave (``agente:ferramenta``)."""
+ 
+-    def __init__(self, config: Optional[RateLimitConfig] = None) -> None:
++    def __init__(
++        self,
++        config: Optional[RateLimitConfig] = None,
++        relogio: Callable[[], float] = time.monotonic,
++    ) -> None:
+         self._config = config or RateLimitConfig()
+         self._buckets: Dict[str, TokenBucket] = {}
+         self._lock = threading.Lock()
+-
+-        from openjarvis._rust_bridge import get_rust_module
+-
+-        _rust = get_rust_module()
+-        self._rust_impl = _rust.RateLimiter(
+-            requests_per_minute=self._config.requests_per_minute,
+-            burst_size=self._config.burst_size,
+-        )
++        self._relogio = relogio
+ 
+     def check(self, key: str) -> Tuple[bool, float]:
+-        """Check if request is allowed for key — always via Rust backend."""
++        """Devolve ``(permitido, segundos_de_espera)`` para a chave."""
+         if not self._config.enabled:
+             return True, 0.0
+-        return self._rust_impl.check(key)
++        return self._get_bucket(key).consume()
+ 
+     def _get_bucket(self, key: str) -> TokenBucket:
+-        """Get or create a bucket for the given key."""
+         with self._lock:
+-            if key not in self._buckets:
+-                rate = self._config.requests_per_minute / 60.0
+-                self._buckets[key] = TokenBucket(
+-                    rate=rate,
++            balde = self._buckets.get(key)
++            if balde is None:
++                if len(self._buckets) >= self._config.max_buckets:
++                    # Remove o mais antigo (ordem de inserção do dict).
++                    self._buckets.pop(next(iter(self._buckets)))
++                balde = TokenBucket(
++                    rate=self._config.requests_per_minute / 60.0,
+                     capacity=self._config.burst_size,
++                    relogio=self._relogio,
+                 )
+-            return self._buckets[key]
++                self._buckets[key] = balde
++            return balde
+ 
+     def reset(self, key: Optional[str] = None) -> None:
+-        """Reset rate limit state for a key or all keys — always via Rust backend."""
+-        self._rust_impl.reset(key)
+-        return
++        """Zera o estado de uma chave (ou de todas)."""
+         with self._lock:
+             if key:
+                 self._buckets.pop(key, None)

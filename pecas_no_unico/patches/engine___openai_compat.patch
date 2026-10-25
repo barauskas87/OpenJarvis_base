@@ -1,0 +1,114 @@
+--- a/src/openjarvis/engine/_openai_compat.py
++++ b/src/openjarvis/engine/_openai_compat.py
+@@ -4,6 +4,7 @@
+ 
+ import json
+ import logging
++import time
+ from collections.abc import AsyncIterator, Sequence
+ from typing import Any, Dict, List
+ 
+@@ -22,7 +23,6 @@
+     AsyncHTTPEngineMixin,
+ )
+ from openjarvis.engine._stubs import StreamChunk
+-from openjarvis.intelligence.model_catalog import resolve_model_id_for_engine
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -77,7 +77,52 @@
+     # -- InferenceEngine interface ------------------------------------------
+ 
+     def _resolve_model_id(self, model: str) -> str:
+-        return resolve_model_id_for_engine(model, self.engine_id)
++        # Patch: sem catálogo embutido; o nome do modelo passa direto ao gateway.
++        return model
++
++    # Patch N24: tentativas para falhas transitórias do gateway.
++    _TENTATIVAS = 3
++    _CODIGOS_TRANSITORIOS = frozenset({429, 502, 503, 504})
++    _dormir = staticmethod(time.sleep)
++
++    def _pausa_para_retry(self, resp: httpx.Response, tentativa: int) -> float:
++        """Segundos de espera: ``Retry-After`` (máx. 30 s) ou 0,5·2^n."""
++        cabecalho = resp.headers.get("retry-after", "")
++        try:
++            return min(30.0, max(0.0, float(cabecalho)))
++        except ValueError:
++            return 0.5 * (2**tentativa)
++
++    def _postar(self, url: str, payload: Dict[str, Any]) -> httpx.Response:
++        """POST com retry de falhas transitórias e remoção segura de ``tools``."""
++        retirou_tools = False
++        for tentativa in range(self._TENTATIVAS + 1):
++            resp = self._client.post(url, json=payload)
++            if resp.status_code in self._CODIGOS_TRANSITORIOS and (
++                tentativa < self._TENTATIVAS
++            ):
++                self._dormir(self._pausa_para_retry(resp, tentativa))
++                continue
++            # Só repete SEM ferramentas se o corpo do erro fala delas; o upstream
++            # repetia em qualquer 400 e escondia outros erros.
++            if (
++                resp.status_code == 400
++                and "tools" in payload
++                and not retirou_tools
++                and any(p in resp.text.lower() for p in ("tool", "function"))
++            ):
++                payload = {
++                    k: v
++                    for k, v in payload.items()
++                    if k not in ("tools", "tool_choice")
++                }
++                retirou_tools = True
++                logger.warning(
++                    "%s rejeitou 'tools'; repetindo sem ferramentas", self.engine_id
++                )
++                continue
++            return resp
++        return resp  # pragma: no cover — o laço sempre retorna antes
+ 
+     def generate(
+         self,
+@@ -101,11 +146,7 @@
+             payload["tool_choice"] = "auto"
+         try:
+             url = f"{self._api_prefix}/chat/completions"
+-            resp = self._client.post(url, json=payload)
+-            if resp.status_code == 400 and "tools" in payload:
+-                payload.pop("tools", None)
+-                payload.pop("tool_choice", None)
+-                resp = self._client.post(url, json=payload)
++            resp = self._postar(url, payload)
+             resp.raise_for_status()
+         except (httpx.ConnectError, httpx.TimeoutException) as exc:
+             raise EngineConnectionError(
+@@ -128,7 +169,14 @@
+                 f"{self.engine_id} engine at {self._host} returned HTTP "
+                 f"{exc.response.status_code}{detail_suffix}"
+             ) from exc
+-        data = resp.json()
++        try:
++            data = resp.json()
++            if not isinstance(data, dict):
++                raise ValueError("corpo não é um objeto JSON")
++        except ValueError as exc:
++            raise EngineConnectionError(
++                f"{self.engine_id} engine at {self._host} devolveu resposta inválida"
++            ) from exc
+         choices = data.get("choices", [])
+         if not choices:
+             return {
+@@ -138,7 +186,11 @@
+                 "finish_reason": "error",
+             }
+         choice = choices[0]
+-        usage = data.get("usage", {})
++        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
++            raise EngineConnectionError(
++                f"{self.engine_id} engine at {self._host} devolveu 'choices' malformado"
++            )
++        usage = data.get("usage", {}) or {}
+         # Ensure prompt_tokens reflects the full prompt size (including
+         # system prompt and all conversation history).
+         # OpenAI-compat APIs (vLLM, SGLang) report full counts — KV

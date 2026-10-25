@@ -1,0 +1,163 @@
+--- a/src/openjarvis/agents/loop_guard.py
++++ b/src/openjarvis/agents/loop_guard.py
+@@ -20,6 +20,10 @@
+     poll_tool_budget: int = 5  # max calls to same polling tool
+     max_context_messages: int = 100  # context overflow threshold
+     warn_before_block: bool = True  # warn on first cycle, block on second
++    # Patch N13: orçamento de chamadas só vale para ferramentas de polling.
++    # No upstream o orçamento (5) valia para TODA ferramenta e bloqueava, por
++    # exemplo, a 6ª busca web de uma execução normal.
++    poll_tools: frozenset = frozenset()
+ 
+ 
+ @dataclass(slots=True)
+@@ -29,6 +33,12 @@
+     blocked: bool = False
+     reason: str = ""
+     warned: bool = False
++    # Patch N13b: tipo do ciclo ("identical_call", "poll_budget", "ping_pong").
++    # O upstream usava o TEXTO do motivo como chave do aviso; como o texto
++    # trazia o contador ("repetida 4 vezes"), a chave mudava a cada chamada e
++    # o bloqueio nunca chegava (sempre "só aviso").
++    kind: str = ""
++    tool: str = ""
+ 
+ 
+ class LoopGuard:
+@@ -54,45 +64,27 @@
+         # Track cycle keys that have already been warned (for warn-before-block)
+         self._warned_cycles: set[str] = set()
+ 
+-        try:
+-            from openjarvis._rust_bridge import get_rust_module
+-
+-            _rust = get_rust_module()
+-            self._rust_impl = _rust.LoopGuard(
+-                max_identical=config.max_identical_calls,
+-                max_ping_pong=(
+-                    config.ping_pong_window // 2 if config.ping_pong_window > 1 else 2
+-                ),
+-                poll_budget=config.poll_tool_budget,
+-            )
+-        except Exception:
+-            self._rust_impl = None
+-
+     def check_call(self, tool_name: str, arguments: str) -> LoopVerdict:
+-        """Check whether a tool call should proceed or be blocked."""
+-        if self._rust_impl is not None:
+-            rust_result = self._rust_impl.check(tool_name, arguments)
+-            # Support both raw Rust return (str | None) and LoopVerdict
+-            if isinstance(rust_result, LoopVerdict):
+-                verdict = rust_result
+-            elif rust_result is not None:
+-                self._emit_triggered("rust_guard", tool_name)
+-                verdict = LoopVerdict(blocked=True, reason=rust_result)
+-            else:
+-                verdict = LoopVerdict()
+-        else:
+-            verdict = self._python_check(tool_name, arguments)
++        """Diz se uma chamada de ferramenta pode seguir ou deve ser bloqueada."""
++        verdict = self._python_check(tool_name, arguments)
+ 
+-        # Wrap with warn-before-block logic
++        # Aviso antes do bloqueio: o primeiro ciclo de cada (tipo, ferramenta)
++        # só avisa; a repetição bloqueia.
+         if verdict.blocked and self._config.warn_before_block:
+-            cycle_key = verdict.reason
+-            if cycle_key not in self._warned_cycles:
+-                self._warned_cycles.add(cycle_key)
+-                return LoopVerdict(blocked=False, warned=True, reason=verdict.reason)
++            chave = f"{verdict.kind}:{verdict.tool}"
++            if chave not in self._warned_cycles:
++                self._warned_cycles.add(chave)
++                return LoopVerdict(
++                    blocked=False,
++                    warned=True,
++                    reason=verdict.reason,
++                    kind=verdict.kind,
++                    tool=verdict.tool,
++                )
+         return verdict
+ 
+     def _python_check(self, tool_name: str, arguments: str) -> LoopVerdict:
+-        """Pure-Python fallback when Rust backend is not available."""
++        """Detecção de laços (somente Python)."""
+         # 1. Hash tracking — identical calls
+         call_hash = hashlib.sha256(f"{tool_name}:{arguments}".encode()).hexdigest()[:16]
+         self._call_counts[call_hash] = self._call_counts.get(call_hash, 0) + 1
+@@ -105,28 +97,41 @@
+                     f"{self._call_counts[call_hash]} times "
+                     f"(max {self._config.max_identical_calls})."
+                 ),
++                kind="identical_call",
++                tool=tool_name,
+             )
+ 
+         # 2. Per-tool budget (polling tools)
+-        self._per_tool_counts[tool_name] = self._per_tool_counts.get(tool_name, 0) + 1
+-        if self._per_tool_counts[tool_name] > self._config.poll_tool_budget:
+-            self._emit_triggered("poll_budget", tool_name)
+-            return LoopVerdict(
+-                blocked=True,
+-                reason=(
+-                    f"Tool '{tool_name}' exceeded poll budget "
+-                    f"({self._config.poll_tool_budget})."
+-                ),
++        if tool_name in self._config.poll_tools:
++            self._per_tool_counts[tool_name] = (
++                self._per_tool_counts.get(tool_name, 0) + 1
+             )
++            if self._per_tool_counts[tool_name] > self._config.poll_tool_budget:
++                self._emit_triggered("poll_budget", tool_name)
++                return LoopVerdict(
++                    blocked=True,
++                    reason=(
++                        f"Tool '{tool_name}' exceeded poll budget "
++                        f"({self._config.poll_tool_budget})."
++                    ),
++                    kind="poll_budget",
++                    tool=tool_name,
++                )
+ 
+         # 3. Ping-pong detection
+-        self._tool_sequence.append(tool_name)
++        # Patch N13c: o ciclo é detectado sobre a ASSINATURA da chamada
++        # (ferramenta + argumentos), não só sobre o nome. No upstream, seis
++        # chamadas seguidas à mesma ferramenta com argumentos diferentes
++        # (ex.: seis buscas) eram "ping-pong" e bloqueadas.
++        self._tool_sequence.append(call_hash)
+         if len(self._tool_sequence) >= self._config.ping_pong_window:
+             if self._detect_ping_pong():
+                 self._emit_triggered("ping_pong", tool_name)
+                 return LoopVerdict(
+                     blocked=True,
+                     reason="Repetitive tool-calling pattern detected (ping-pong).",
++                    kind="ping_pong",
++                    tool=tool_name,
+                 )
+ 
+         return LoopVerdict()
+@@ -210,13 +215,11 @@
+         return sys_final + tail[-4:]
+ 
+     def reset(self) -> None:
+-        """Reset all tracking state — always via Rust backend."""
++        """Zera todo o estado de rastreamento."""
+         self._call_counts.clear()
+         self._tool_sequence.clear()
+         self._per_tool_counts.clear()
+         self._warned_cycles.clear()
+-        if self._rust_impl is not None:
+-            self._rust_impl.reset()
+ 
+     def _detect_ping_pong(self) -> bool:
+         """Detect repeating patterns in tool call sequence."""
+@@ -227,6 +230,8 @@
+             if n >= period * 2:
+                 tail = seq[-period * 2 :]
+                 pattern = tail[:period]
++                if len(set(pattern)) < 2:
++                    continue  # repetição de uma só chamada é outro detector
+                 if all(tail[i] == pattern[i % period] for i in range(len(tail))):
+                     return True
+         return False
